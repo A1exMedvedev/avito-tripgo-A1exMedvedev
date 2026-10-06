@@ -70,12 +70,15 @@ func (m *TxManager) Do(ctx context.Context, fn func(ctx context.Context) error) 
 }
 
 func (m *TxManager) rollback(ctx context.Context, tx pgx.Tx) error {
+	connClosed := tx.Conn().IsClosed()
+
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.rollbackTimeout)
 	defer cancel()
 
-	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
-		return fmt.Errorf("rollback tx: %w", err)
+	err := tx.Rollback(ctx)
+	if err == nil || errors.Is(err, pgx.ErrTxClosed) || connClosed {
+		return nil
 	}
 
-	return nil
+	return fmt.Errorf("rollback tx: %w", err)
 }
