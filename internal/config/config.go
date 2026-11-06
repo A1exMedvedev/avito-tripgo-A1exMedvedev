@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -15,6 +16,14 @@ type Config struct {
 	IdempotencyKeyTTL time.Duration
 	HTTP              HTTP
 	DB                DB
+	Telemetry         Telemetry
+}
+
+const otlpProtocolHTTP = "http/protobuf"
+
+type Telemetry struct {
+	ServiceName string
+	Endpoint    string
 }
 
 type HTTP struct {
@@ -65,6 +74,15 @@ func Load() (Config, error) {
 		p.errs = append(p.errs, errors.New("DATABASE_MIN_CONNS must not exceed DATABASE_MAX_CONNS"))
 	}
 
+	cfg.Telemetry = Telemetry{
+		ServiceName: p.stringOr("OTEL_SERVICE_NAME", "trip-service"),
+		Endpoint:    strings.TrimRight(p.string("OTEL_EXPORTER_OTLP_ENDPOINT"), "/"),
+	}
+
+	if protocol := p.stringOr("OTEL_EXPORTER_OTLP_PROTOCOL", otlpProtocolHTTP); protocol != otlpProtocolHTTP {
+		p.errs = append(p.errs, fmt.Errorf("OTEL_EXPORTER_OTLP_PROTOCOL must be %s, got %s", otlpProtocolHTTP, protocol))
+	}
+
 	if err := errors.Join(p.errs...); err != nil {
 		return Config{}, fmt.Errorf("invalid config: %w", err)
 	}
@@ -96,6 +114,15 @@ func (p *parser) required(key string) (string, bool) {
 
 func (p *parser) string(key string) string {
 	v, _ := p.required(key)
+	return v
+}
+
+func (p *parser) stringOr(key, def string) string {
+	v, ok := p.lookup(key)
+	if !ok {
+		return def
+	}
+
 	return v
 }
 

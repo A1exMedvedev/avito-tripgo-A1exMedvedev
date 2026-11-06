@@ -1,4 +1,4 @@
-package httpapi
+package router
 
 import (
 	"context"
@@ -12,13 +12,26 @@ import (
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/go-chi/chi/v5"
 	nethttpmiddleware "github.com/oapi-codegen/nethttp-middleware"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/api"
+	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/http/domainerror"
+	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/http/middleware"
+	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/http/response"
 )
 
 const maxBodyBytes = 1 << 20
 
-func NewRouter(h *Handler, log *slog.Logger) (http.Handler, error) {
+type Telemetry struct {
+	Log            *slog.Logger
+	TracerProvider trace.TracerProvider
+	MeterProvider  metric.MeterProvider
+	Propagator     propagation.TextMapPropagator
+}
+
+func New(h Handlers, tel Telemetry) (http.Handler, error) {
 	spec, err := api.GetSpec()
 	if err != nil {
 		return nil, fmt.Errorf("load openapi spec: %w", err)
@@ -33,18 +46,29 @@ func NewRouter(h *Handler, log *slog.Logger) (http.Handler, error) {
 			AuthenticationFunc: openapi3filter.NoopAuthenticationFunc,
 		},
 		ErrorHandlerWithOpts: func(_ context.Context, err error, w http.ResponseWriter, r *http.Request, _ nethttpmiddleware.ErrorHandlerOpts) {
-			writeProblem(w, r, problemInvalidRequest, validationDetail(err))
+			response.Problem(w, r, domainerror.InvalidRequest(validationDetail(err)))
 		},
 	})
 
-	r := chi.NewRouter()
-	r.Use(recoverer(log), limitBody(maxBodyBytes))
+	metrics, err := middleware.Metrics(tel.MeterProvider)
+	if err != nil {
+		return nil, err
+	}
 
-	return api.HandlerWithOptions(h, api.ChiServerOptions{
+	r := chi.NewRouter()
+	r.Use(
+		middleware.Recover(tel.Log),
+		middleware.Tracing(tel.TracerProvider, tel.Propagator),
+		middleware.Logging(tel.Log),
+		metrics,
+		limitBody(maxBodyBytes),
+	)
+
+	return api.HandlerWithOptions(&server{handlers: h}, api.ChiServerOptions{
 		BaseRouter:  r,
 		Middlewares: []api.MiddlewareFunc{validator},
 		ErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
-			writeProblem(w, r, problemInvalidRequest, err.Error())
+			response.Problem(w, r, domainerror.InvalidRequest(err.Error()))
 		},
 	}), nil
 }
@@ -62,39 +86,13 @@ func validationDetail(err error) string {
 		return reqErr.Reason
 	}
 
-	return problemInvalidRequest.detail
+	return ""
 }
 
 func limitBody(n int64) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			r.Body = http.MaxBytesReader(w, r.Body, n)
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-
-func recoverer(log *slog.Logger) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			defer func() {
-				p := recover()
-				if p == nil {
-					return
-				}
-
-				if p == http.ErrAbortHandler {
-					panic(p)
-				}
-
-				log.ErrorContext(r.Context(), "panic in handler",
-					slog.String("method", r.Method),
-					slog.String("path", r.URL.Path),
-					slog.Any("panic", p),
-				)
-				writeProblem(w, r, problemInternal, "")
-			}()
-
 			next.ServeHTTP(w, r)
 		})
 	}
