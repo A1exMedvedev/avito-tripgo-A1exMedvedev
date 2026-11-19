@@ -2,14 +2,11 @@ package finish_test
 
 import (
 	"context"
-	"errors"
-	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/domain/trip"
@@ -17,141 +14,136 @@ import (
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/usecase/trip/finish"
 )
 
-var (
-	now     = time.Date(2026, 8, 24, 12, 18, 0, 0, time.UTC)
-	errRepo = errors.New("connection refused")
-)
-
-type deps struct {
+type mocks struct {
 	trips   *MocktripRepository
 	metrics *Mockmetrics
-	usecase *finish.Usecase
+	log     *Mocklogger
 }
 
-func newDeps(t *testing.T) deps {
-	t.Helper()
+func TestUsecase_Do(t *testing.T) {
+	tripID := uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	now := time.Date(2026, 8, 24, 12, 18, 0, 0, time.UTC)
 
-	ctrl := gomock.NewController(t)
-	d := deps{trips: NewMocktripRepository(ctrl), metrics: NewMockmetrics(ctrl)}
+	active := trip.Trip{ID: tripID, Status: trip.StatusActive}
+	completed := trip.Trip{ID: tripID, Status: trip.StatusCompleted, FinishedAt: &now}
+	statusChange := model.StatusChange{
+		TripID:    tripID,
+		From:      new(trip.StatusActive),
+		To:        trip.StatusCompleted,
+		Reason:    "trip finished",
+		ChangedAt: now,
+	}
 
+	tests := []struct {
+		name    string
+		setup   func(m mocks)
+		in      uuid.UUID
+		want    trip.Trip
+		wantErr assert.ErrorAssertionFunc
+	}{
+		{
+			name: "успех, активная поездка завершена",
+			setup: func(m mocks) {
+				m.trips.EXPECT().Fetch(gomock.Any(), tripID).Return(active, nil)
+				m.trips.EXPECT().Finish(gomock.Any(), completed).Return(nil)
+				m.trips.EXPECT().SaveStatusChange(gomock.Any(), statusChange).Return(nil)
+				m.metrics.EXPECT().TripCompleted(gomock.Any())
+				m.log.EXPECT().InfoContext(gomock.Any(), "trip completed", gomock.Any())
+			},
+			in:      tripID,
+			want:    completed,
+			wantErr: assert.NoError,
+		},
+		{
+			name: "ошибка, поездка уже завершена, в бд ничего не пишем",
+			setup: func(m mocks) {
+				m.trips.EXPECT().Fetch(gomock.Any(), tripID).Return(completed, nil)
+			},
+			in:      tripID,
+			want:    trip.Trip{},
+			wantErr: errorIs(trip.ErrTripCompleted),
+		},
+		{
+			name: "ошибка, параллельный запрос успел завершить поездку",
+			setup: func(m mocks) {
+				m.trips.EXPECT().Fetch(gomock.Any(), tripID).Return(active, nil)
+				m.trips.EXPECT().Finish(gomock.Any(), completed).Return(trip.ErrTripCompleted)
+			},
+			in:      tripID,
+			want:    trip.Trip{},
+			wantErr: errorIs(trip.ErrTripCompleted),
+		},
+		{
+			name: "ошибка, поездка не найдена",
+			setup: func(m mocks) {
+				m.trips.EXPECT().Fetch(gomock.Any(), tripID).Return(trip.Trip{}, trip.ErrTripNotFound)
+			},
+			in:      tripID,
+			want:    trip.Trip{},
+			wantErr: errorIs(trip.ErrTripNotFound),
+		},
+		{
+			name: "ошибка репозитория при чтении",
+			setup: func(m mocks) {
+				m.trips.EXPECT().Fetch(gomock.Any(), tripID).Return(trip.Trip{}, assert.AnError)
+			},
+			in:      tripID,
+			want:    trip.Trip{},
+			wantErr: errorIs(assert.AnError),
+		},
+		{
+			name: "ошибка репозитория при обновлении",
+			setup: func(m mocks) {
+				m.trips.EXPECT().Fetch(gomock.Any(), tripID).Return(active, nil)
+				m.trips.EXPECT().Finish(gomock.Any(), completed).Return(assert.AnError)
+			},
+			in:      tripID,
+			want:    trip.Trip{},
+			wantErr: errorIs(assert.AnError),
+		},
+		{
+			name: "ошибка репозитория при записи в журнал статусов",
+			setup: func(m mocks) {
+				m.trips.EXPECT().Fetch(gomock.Any(), tripID).Return(active, nil)
+				m.trips.EXPECT().Finish(gomock.Any(), completed).Return(nil)
+				m.trips.EXPECT().SaveStatusChange(gomock.Any(), statusChange).Return(assert.AnError)
+			},
+			in:      tripID,
+			want:    trip.Trip{},
+			wantErr: errorIs(assert.AnError),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			m := mocks{
+				trips:   NewMocktripRepository(ctrl),
+				metrics: NewMockmetrics(ctrl),
+				log:     NewMocklogger(ctrl),
+			}
+			tt.setup(m)
+
+			uc := finish.New(m.trips, passThroughTx(ctrl), m.metrics, m.log, func() time.Time { return now })
+			got, err := uc.Do(context.Background(), tt.in)
+
+			tt.wantErr(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func passThroughTx(ctrl *gomock.Controller) *MocktxManager {
 	tx := NewMocktxManager(ctrl)
 	tx.EXPECT().Do(gomock.Any(), gomock.Any()).
 		DoAndReturn(func(ctx context.Context, fn func(context.Context) error) error { return fn(ctx) }).
 		AnyTimes()
 
-	d.usecase = finish.New(d.trips, tx, d.metrics, slog.New(slog.DiscardHandler), func() time.Time { return now })
-
-	return d
+	return tx
 }
 
-func TestDo_ActiveTrip(t *testing.T) {
-	t.Parallel()
-
-	d := newDeps(t)
-	id := uuid.New()
-
-	gomock.InOrder(
-		d.trips.EXPECT().Fetch(gomock.Any(), id).Return(trip.Trip{ID: id, Status: trip.StatusActive}, nil),
-		d.trips.EXPECT().Finish(gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, tr trip.Trip) error {
-				assert.Equal(t, trip.StatusCompleted, tr.Status)
-				assert.Equal(t, &now, tr.FinishedAt)
-
-				return nil
-			}),
-		d.trips.EXPECT().SaveStatusChange(gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, c model.StatusChange) error {
-				assert.Equal(t, id, c.TripID)
-				assert.Equal(t, new(trip.StatusActive), c.From)
-				assert.Equal(t, trip.StatusCompleted, c.To)
-				assert.Equal(t, now, c.ChangedAt)
-				assert.Equal(t, "trip finished", c.Reason)
-
-				return nil
-			}),
-		d.metrics.EXPECT().TripCompleted(gomock.Any()),
-	)
-
-	got, err := d.usecase.Do(context.Background(), id)
-
-	require.NoError(t, err)
-	assert.Equal(t, trip.StatusCompleted, got.Status)
-	assert.Equal(t, &now, got.FinishedAt)
-}
-
-func TestDo_CompletedTrip_NothingIsWritten(t *testing.T) {
-	t.Parallel()
-
-	d := newDeps(t)
-	id := uuid.New()
-	d.trips.EXPECT().Fetch(gomock.Any(), id).Return(trip.Trip{ID: id, Status: trip.StatusCompleted}, nil)
-
-	_, err := d.usecase.Do(context.Background(), id)
-
-	require.ErrorIs(t, err, trip.ErrTripCompleted)
-}
-
-func TestDo_LostRaceWithConcurrentFinish(t *testing.T) {
-	t.Parallel()
-
-	d := newDeps(t)
-	id := uuid.New()
-	d.trips.EXPECT().Fetch(gomock.Any(), id).Return(trip.Trip{ID: id, Status: trip.StatusActive}, nil)
-	d.trips.EXPECT().Finish(gomock.Any(), gomock.Any()).Return(trip.ErrTripCompleted)
-
-	_, err := d.usecase.Do(context.Background(), id)
-
-	require.ErrorIs(t, err, trip.ErrTripCompleted)
-}
-
-func TestDo_NotFound(t *testing.T) {
-	t.Parallel()
-
-	d := newDeps(t)
-	id := uuid.New()
-	d.trips.EXPECT().Fetch(gomock.Any(), id).Return(trip.Trip{}, trip.ErrTripNotFound)
-
-	_, err := d.usecase.Do(context.Background(), id)
-
-	require.ErrorIs(t, err, trip.ErrTripNotFound)
-}
-
-func TestDo_RepositoryErrorsAreReturned(t *testing.T) {
-	t.Parallel()
-
-	t.Run("fetch", func(t *testing.T) {
-		t.Parallel()
-
-		d := newDeps(t)
-		d.trips.EXPECT().Fetch(gomock.Any(), gomock.Any()).Return(trip.Trip{}, errRepo)
-
-		_, err := d.usecase.Do(context.Background(), uuid.New())
-
-		require.ErrorIs(t, err, errRepo)
-	})
-
-	t.Run("finish", func(t *testing.T) {
-		t.Parallel()
-
-		d := newDeps(t)
-		d.trips.EXPECT().Fetch(gomock.Any(), gomock.Any()).Return(trip.Trip{Status: trip.StatusActive}, nil)
-		d.trips.EXPECT().Finish(gomock.Any(), gomock.Any()).Return(errRepo)
-
-		_, err := d.usecase.Do(context.Background(), uuid.New())
-
-		require.ErrorIs(t, err, errRepo)
-	})
-
-	t.Run("status history", func(t *testing.T) {
-		t.Parallel()
-
-		d := newDeps(t)
-		d.trips.EXPECT().Fetch(gomock.Any(), gomock.Any()).Return(trip.Trip{Status: trip.StatusActive}, nil)
-		d.trips.EXPECT().Finish(gomock.Any(), gomock.Any()).Return(nil)
-		d.trips.EXPECT().SaveStatusChange(gomock.Any(), gomock.Any()).Return(errRepo)
-
-		_, err := d.usecase.Do(context.Background(), uuid.New())
-
-		require.ErrorIs(t, err, errRepo)
-	})
+func errorIs(target error) assert.ErrorAssertionFunc {
+	return func(t assert.TestingT, err error, msgAndArgs ...any) bool {
+		return assert.ErrorIs(t, err, target, msgAndArgs...)
+	}
 }

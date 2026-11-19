@@ -18,11 +18,11 @@ type Usecase struct {
 	trips   tripRepository
 	tx      txManager
 	metrics metrics
-	log     *slog.Logger
+	log     logger
 	now     func() time.Time
 }
 
-func New(trips tripRepository, tx txManager, m metrics, log *slog.Logger, now func() time.Time) *Usecase {
+func New(trips tripRepository, tx txManager, m metrics, log logger, now func() time.Time) *Usecase {
 	return &Usecase{trips: trips, tx: tx, metrics: m, log: log, now: now}
 }
 

@@ -2,14 +2,11 @@ package create_test
 
 import (
 	"context"
-	"errors"
-	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/domain/trip"
@@ -17,246 +14,176 @@ import (
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/usecase/trip/create"
 )
 
-const idempotencyTTL = 24 * time.Hour
-
-var (
-	now     = time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
-	errRepo = errors.New("connection refused")
-)
-
-type deps struct {
-	trips   *MocktripRepository
-	keys    *MockidempotencyRepository
-	metrics *Mockmetrics
-	usecase *create.Usecase
+type mocks struct {
+	trips       *MocktripRepository
+	idempotency *Mockidempotency
+	metrics     *Mockmetrics
+	log         *Mocklogger
 }
 
-func newDeps(t *testing.T) deps {
-	t.Helper()
+func TestUsecase_Do(t *testing.T) {
+	tripID := uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	existingID := uuid.MustParse("00000000-0000-4000-8000-000000000002")
+	key := uuid.MustParse("00000000-0000-4000-8000-000000000003")
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 
-	ctrl := gomock.NewController(t)
-	d := deps{
-		trips:   NewMocktripRepository(ctrl),
-		keys:    NewMockidempotencyRepository(ctrl),
-		metrics: NewMockmetrics(ctrl),
+	params := trip.Params{
+		UserID:   uuid.MustParse("00000000-0000-4000-8000-000000000004"),
+		DriverID: uuid.MustParse("00000000-0000-4000-8000-000000000005"),
+		Start:    trip.Point{Latitude: 59.9398, Longitude: 30.3146},
+		End:      trip.Point{Latitude: 59.9290, Longitude: 30.3626},
+		Price:    1450,
+	}
+	created := trip.Trip{
+		ID:        tripID,
+		UserID:    params.UserID,
+		DriverID:  params.DriverID,
+		Start:     params.Start,
+		End:       params.End,
+		Price:     params.Price,
+		Status:    trip.StatusActive,
+		StartedAt: now,
+	}
+	existing := trip.Trip{ID: existingID, Status: trip.StatusCompleted}
+	statusChange := model.StatusChange{TripID: tripID, To: trip.StatusActive, Reason: "trip created", ChangedAt: now}
+	claimedKey := gomock.Cond(func(k model.IdempotencyKey) bool {
+		return k.Key == key && k.TripID == tripID && k.CreatedAt.Equal(now) && len(k.RequestHash) == 32
+	})
+
+	tests := []struct {
+		name    string
+		setup   func(m mocks)
+		in      model.CreateTripInput
+		want    model.CreateTripResult
+		wantErr assert.ErrorAssertionFunc
+	}{
+		{
+			name: "успех без ключа идемпотентности",
+			setup: func(m mocks) {
+				m.trips.EXPECT().Save(gomock.Any(), created).Return(nil)
+				m.trips.EXPECT().SaveStatusChange(gomock.Any(), statusChange).Return(nil)
+				m.metrics.EXPECT().TripCreated(gomock.Any())
+				m.log.EXPECT().InfoContext(gomock.Any(), "trip created", gomock.Any())
+			},
+			in:      model.CreateTripInput{Params: params},
+			want:    model.CreateTripResult{Trip: created},
+			wantErr: assert.NoError,
+		},
+		{
+			name: "успех, ключ идемпотентности занят впервые",
+			setup: func(m mocks) {
+				m.idempotency.EXPECT().Claim(gomock.Any(), claimedKey).Return(uuid.Nil, true, nil)
+				m.trips.EXPECT().Save(gomock.Any(), created).Return(nil)
+				m.trips.EXPECT().SaveStatusChange(gomock.Any(), statusChange).Return(nil)
+				m.metrics.EXPECT().TripCreated(gomock.Any())
+				m.log.EXPECT().InfoContext(gomock.Any(), "trip created", gomock.Any())
+			},
+			in:      model.CreateTripInput{Params: params, IdempotencyKey: &key},
+			want:    model.CreateTripResult{Trip: created},
+			wantErr: assert.NoError,
+		},
+		{
+			name: "повтор с тем же ключом возвращает существующую поездку без метрики и лога",
+			setup: func(m mocks) {
+				m.idempotency.EXPECT().Claim(gomock.Any(), claimedKey).Return(existingID, false, nil)
+				m.trips.EXPECT().Fetch(gomock.Any(), existingID).Return(existing, nil)
+			},
+			in:      model.CreateTripInput{Params: params, IdempotencyKey: &key},
+			want:    model.CreateTripResult{Trip: existing, Replayed: true},
+			wantErr: assert.NoError,
+		},
+		{
+			name: "ошибка, ключ уже использован с другим телом",
+			setup: func(m mocks) {
+				m.idempotency.EXPECT().Claim(gomock.Any(), claimedKey).Return(uuid.Nil, false, trip.ErrIdempotencyConflict)
+			},
+			in:      model.CreateTripInput{Params: params, IdempotencyKey: &key},
+			want:    model.CreateTripResult{},
+			wantErr: errorIs(trip.ErrIdempotencyConflict),
+		},
+		{
+			name: "ошибка при занятии ключа",
+			setup: func(m mocks) {
+				m.idempotency.EXPECT().Claim(gomock.Any(), claimedKey).Return(uuid.Nil, false, assert.AnError)
+			},
+			in:      model.CreateTripInput{Params: params, IdempotencyKey: &key},
+			want:    model.CreateTripResult{},
+			wantErr: errorIs(assert.AnError),
+		},
+		{
+			name:  "ошибка валидации, в репозиторий не ходим",
+			setup: func(mocks) {},
+			in:    model.CreateTripInput{Params: trip.Params{}},
+			want:  model.CreateTripResult{},
+			wantErr: func(t assert.TestingT, err error, msgAndArgs ...any) bool {
+				var validationErr *trip.ValidationError
+				return assert.ErrorAs(t, err, &validationErr, msgAndArgs...)
+			},
+		},
+		{
+			name: "ошибка, водитель занят",
+			setup: func(m mocks) {
+				m.trips.EXPECT().Save(gomock.Any(), created).Return(trip.ErrDriverBusy)
+			},
+			in:      model.CreateTripInput{Params: params},
+			want:    model.CreateTripResult{},
+			wantErr: errorIs(trip.ErrDriverBusy),
+		},
+		{
+			name: "ошибка репозитория при сохранении поездки",
+			setup: func(m mocks) {
+				m.trips.EXPECT().Save(gomock.Any(), created).Return(assert.AnError)
+			},
+			in:      model.CreateTripInput{Params: params},
+			want:    model.CreateTripResult{},
+			wantErr: errorIs(assert.AnError),
+		},
+		{
+			name: "ошибка репозитория при записи в журнал статусов",
+			setup: func(m mocks) {
+				m.trips.EXPECT().Save(gomock.Any(), created).Return(nil)
+				m.trips.EXPECT().SaveStatusChange(gomock.Any(), statusChange).Return(assert.AnError)
+			},
+			in:      model.CreateTripInput{Params: params},
+			want:    model.CreateTripResult{},
+			wantErr: errorIs(assert.AnError),
+		},
 	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			m := mocks{
+				trips:       NewMocktripRepository(ctrl),
+				idempotency: NewMockidempotency(ctrl),
+				metrics:     NewMockmetrics(ctrl),
+				log:         NewMocklogger(ctrl),
+			}
+			tt.setup(m)
+
+			uc := create.New(m.trips, m.idempotency, passThroughTx(ctrl), m.metrics, m.log,
+				func() time.Time { return now },
+				func() (uuid.UUID, error) { return tripID, nil },
+			)
+			got, err := uc.Do(context.Background(), tt.in)
+
+			tt.wantErr(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func passThroughTx(ctrl *gomock.Controller) *MocktxManager {
 	tx := NewMocktxManager(ctrl)
 	tx.EXPECT().Do(gomock.Any(), gomock.Any()).
 		DoAndReturn(func(ctx context.Context, fn func(context.Context) error) error { return fn(ctx) }).
 		AnyTimes()
 
-	d.usecase = create.New(d.trips, d.keys, tx, d.metrics, slog.New(slog.DiscardHandler), func() time.Time { return now }, idempotencyTTL)
-
-	return d
+	return tx
 }
 
-func params() trip.Params {
-	return trip.Params{
-		UserID:   uuid.New(),
-		DriverID: uuid.New(),
-		Start:    trip.Point{Latitude: 59.9398, Longitude: 30.3146},
-		End:      trip.Point{Latitude: 59.9290, Longitude: 30.3626},
-		Price:    1450,
+func errorIs(target error) assert.ErrorAssertionFunc {
+	return func(t assert.TestingT, err error, msgAndArgs ...any) bool {
+		return assert.ErrorIs(t, err, target, msgAndArgs...)
 	}
-}
-
-func TestDo_Success(t *testing.T) {
-	t.Parallel()
-
-	d := newDeps(t)
-	p := params()
-
-	var saved trip.Trip
-
-	gomock.InOrder(
-		d.trips.EXPECT().Save(gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, tr trip.Trip) error {
-				saved = tr
-				return nil
-			}),
-		d.trips.EXPECT().SaveStatusChange(gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, c model.StatusChange) error {
-				assert.Equal(t, saved.ID, c.TripID)
-				assert.Nil(t, c.From)
-				assert.Equal(t, trip.StatusActive, c.To)
-				assert.Equal(t, now, c.ChangedAt)
-				assert.Equal(t, "trip created", c.Reason)
-
-				return nil
-			}),
-		d.metrics.EXPECT().TripCreated(gomock.Any()),
-	)
-
-	got, err := d.usecase.Do(context.Background(), model.CreateTripInput{Params: p})
-
-	require.NoError(t, err)
-	assert.False(t, got.Replayed)
-	assert.Equal(t, saved, got.Trip)
-	assert.NotEqual(t, uuid.Nil, got.Trip.ID)
-	assert.Equal(t, trip.StatusActive, got.Trip.Status)
-	assert.Equal(t, now, got.Trip.StartedAt)
-	assert.Equal(t, p.DriverID, got.Trip.DriverID)
-}
-
-func TestDo_InvalidParams_RepositoryIsNotCalled(t *testing.T) {
-	t.Parallel()
-
-	d := newDeps(t)
-
-	_, err := d.usecase.Do(context.Background(), model.CreateTripInput{Params: trip.Params{}})
-
-	var validationErr *trip.ValidationError
-	require.ErrorAs(t, err, &validationErr)
-}
-
-func TestDo_DriverBusy(t *testing.T) {
-	t.Parallel()
-
-	d := newDeps(t)
-	d.trips.EXPECT().Save(gomock.Any(), gomock.Any()).Return(trip.ErrDriverBusy)
-
-	_, err := d.usecase.Do(context.Background(), model.CreateTripInput{Params: params()})
-
-	require.ErrorIs(t, err, trip.ErrDriverBusy)
-}
-
-func TestDo_RepositoryErrorsAreReturned(t *testing.T) {
-	t.Parallel()
-
-	t.Run("save", func(t *testing.T) {
-		t.Parallel()
-
-		d := newDeps(t)
-		d.trips.EXPECT().Save(gomock.Any(), gomock.Any()).Return(errRepo)
-
-		_, err := d.usecase.Do(context.Background(), model.CreateTripInput{Params: params()})
-
-		require.ErrorIs(t, err, errRepo)
-	})
-
-	t.Run("status history", func(t *testing.T) {
-		t.Parallel()
-
-		d := newDeps(t)
-		d.trips.EXPECT().Save(gomock.Any(), gomock.Any()).Return(nil)
-		d.trips.EXPECT().SaveStatusChange(gomock.Any(), gomock.Any()).Return(errRepo)
-
-		_, err := d.usecase.Do(context.Background(), model.CreateTripInput{Params: params()})
-
-		require.ErrorIs(t, err, errRepo)
-	})
-}
-
-func TestDo_IdempotencyKeyClaimed(t *testing.T) {
-	t.Parallel()
-
-	d := newDeps(t)
-	key := uuid.New()
-
-	gomock.InOrder(
-		d.keys.EXPECT().ClaimIdempotencyKey(gomock.Any(), gomock.Any(), now.Add(-idempotencyTTL)).
-			DoAndReturn(func(_ context.Context, k model.IdempotencyKey, _ time.Time) (bool, error) {
-				assert.Equal(t, key, k.Key)
-				assert.Equal(t, now, k.CreatedAt)
-				assert.Len(t, k.RequestHash, 32)
-
-				return true, nil
-			}),
-		d.trips.EXPECT().Save(gomock.Any(), gomock.Any()).Return(nil),
-		d.trips.EXPECT().SaveStatusChange(gomock.Any(), gomock.Any()).Return(nil),
-		d.metrics.EXPECT().TripCreated(gomock.Any()),
-	)
-
-	got, err := d.usecase.Do(context.Background(), model.CreateTripInput{Params: params(), IdempotencyKey: &key})
-
-	require.NoError(t, err)
-	assert.False(t, got.Replayed)
-}
-
-func recordRequestHash(t *testing.T, p trip.Params) []byte {
-	t.Helper()
-
-	d := newDeps(t)
-	key := uuid.New()
-
-	var hash []byte
-
-	d.keys.EXPECT().ClaimIdempotencyKey(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, k model.IdempotencyKey, _ time.Time) (bool, error) {
-			hash = k.RequestHash
-			return true, nil
-		})
-	d.trips.EXPECT().Save(gomock.Any(), gomock.Any()).Return(nil)
-	d.trips.EXPECT().SaveStatusChange(gomock.Any(), gomock.Any()).Return(nil)
-	d.metrics.EXPECT().TripCreated(gomock.Any())
-
-	_, err := d.usecase.Do(context.Background(), model.CreateTripInput{Params: p, IdempotencyKey: &key})
-	require.NoError(t, err)
-
-	return hash
-}
-
-func TestDo_IdempotencyReplay_ReturnsExistingTrip_WithoutMetric(t *testing.T) {
-	t.Parallel()
-
-	d := newDeps(t)
-	key := uuid.New()
-	p := params()
-	existing := trip.Trip{ID: uuid.New(), Status: trip.StatusCompleted}
-
-	d.keys.EXPECT().ClaimIdempotencyKey(gomock.Any(), gomock.Any(), gomock.Any()).Return(false, nil)
-	d.keys.EXPECT().FetchIdempotencyKey(gomock.Any(), key).
-		Return(model.IdempotencyKey{Key: key, RequestHash: recordRequestHash(t, p), TripID: existing.ID}, nil)
-	d.trips.EXPECT().Fetch(gomock.Any(), existing.ID).Return(existing, nil)
-
-	got, err := d.usecase.Do(context.Background(), model.CreateTripInput{Params: p, IdempotencyKey: &key})
-
-	require.NoError(t, err)
-	assert.True(t, got.Replayed)
-	assert.Equal(t, existing, got.Trip)
-}
-
-func TestDo_IdempotencyConflict(t *testing.T) {
-	t.Parallel()
-
-	d := newDeps(t)
-	key := uuid.New()
-
-	d.keys.EXPECT().ClaimIdempotencyKey(gomock.Any(), gomock.Any(), gomock.Any()).Return(false, nil)
-	d.keys.EXPECT().FetchIdempotencyKey(gomock.Any(), key).
-		Return(model.IdempotencyKey{Key: key, RequestHash: recordRequestHash(t, params())}, nil)
-
-	_, err := d.usecase.Do(context.Background(), model.CreateTripInput{Params: params(), IdempotencyKey: &key})
-
-	require.ErrorIs(t, err, trip.ErrIdempotencyConflict)
-}
-
-func TestDo_IdempotencyRepositoryErrors(t *testing.T) {
-	t.Parallel()
-
-	t.Run("claim", func(t *testing.T) {
-		t.Parallel()
-
-		d := newDeps(t)
-		key := uuid.New()
-		d.keys.EXPECT().ClaimIdempotencyKey(gomock.Any(), gomock.Any(), gomock.Any()).Return(false, errRepo)
-
-		_, err := d.usecase.Do(context.Background(), model.CreateTripInput{Params: params(), IdempotencyKey: &key})
-
-		require.ErrorIs(t, err, errRepo)
-	})
-
-	t.Run("fetch", func(t *testing.T) {
-		t.Parallel()
-
-		d := newDeps(t)
-		key := uuid.New()
-		d.keys.EXPECT().ClaimIdempotencyKey(gomock.Any(), gomock.Any(), gomock.Any()).Return(false, nil)
-		d.keys.EXPECT().FetchIdempotencyKey(gomock.Any(), key).Return(model.IdempotencyKey{}, errRepo)
-
-		_, err := d.usecase.Do(context.Background(), model.CreateTripInput{Params: params(), IdempotencyKey: &key})
-
-		require.ErrorIs(t, err, errRepo)
-	})
 }

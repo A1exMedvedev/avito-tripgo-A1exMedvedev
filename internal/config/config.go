@@ -4,189 +4,79 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"strconv"
+	"reflect"
 	"strings"
 	"time"
+
+	"github.com/caarlos0/env/v11"
+	"github.com/go-playground/validator/v10"
 )
 
 type Config struct {
-	LogLevel          slog.Level
-	ShutdownTimeout   time.Duration
-	IdempotencyKeyTTL time.Duration
+	LogLevel          slog.Level    `env:"LOG_LEVEL,required,notEmpty"`
+	ShutdownTimeout   time.Duration `env:"SHUTDOWN_TIMEOUT,required,notEmpty" validate:"gt=0"`
+	IdempotencyKeyTTL time.Duration `env:"IDEMPOTENCY_KEY_TTL" envDefault:"24h" validate:"gt=0"`
 	HTTP              HTTP
 	DB                DB
 	Telemetry         Telemetry
 }
 
-const otlpProtocolHTTP = "http/protobuf"
-
-type Telemetry struct {
-	ServiceName string
-	Endpoint    string
-}
-
 type HTTP struct {
-	Addr              string
-	ReadTimeout       time.Duration
-	ReadHeaderTimeout time.Duration
-	WriteTimeout      time.Duration
-	IdleTimeout       time.Duration
+	Addr              string        `env:"HTTP_ADDR,required,notEmpty"`
+	ReadTimeout       time.Duration `env:"HTTP_READ_TIMEOUT" envDefault:"10s" validate:"gt=0"`
+	ReadHeaderTimeout time.Duration `env:"HTTP_READ_HEADER_TIMEOUT" envDefault:"5s" validate:"gt=0"`
+	WriteTimeout      time.Duration `env:"HTTP_WRITE_TIMEOUT" envDefault:"15s" validate:"gt=0"`
+	IdleTimeout       time.Duration `env:"HTTP_IDLE_TIMEOUT" envDefault:"60s" validate:"gt=0"`
 }
 
 type DB struct {
-	URL             string
-	MaxConns        int32
-	MinConns        int32
-	MaxConnLifetime time.Duration
-	ConnectTimeout  time.Duration
-	QueryTimeout    time.Duration
+	URL             string        `env:"DATABASE_URL,required,notEmpty"`
+	MaxConns        int32         `env:"DATABASE_MAX_CONNS,required,notEmpty" validate:"gte=0"`
+	MinConns        int32         `env:"DATABASE_MIN_CONNS,required,notEmpty" validate:"gte=0,ltefield=MaxConns"`
+	MaxConnLifetime time.Duration `env:"DATABASE_MAX_CONN_LIFETIME,required,notEmpty" validate:"gt=0"`
+	ConnectTimeout  time.Duration `env:"DATABASE_CONNECT_TIMEOUT,required,notEmpty" validate:"gt=0"`
+	QueryTimeout    time.Duration `env:"DATABASE_QUERY_TIMEOUT,required,notEmpty" validate:"gt=0"`
+}
+
+type Telemetry struct {
+	ServiceName string `env:"OTEL_SERVICE_NAME" envDefault:"trip-service"`
+	Endpoint    string `env:"OTEL_EXPORTER_OTLP_ENDPOINT,required,notEmpty"`
+	Protocol    string `env:"OTEL_EXPORTER_OTLP_PROTOCOL" envDefault:"http/protobuf" validate:"oneof=http/protobuf"`
 }
 
 func Load() (Config, error) {
-	var (
-		p   parser
-		cfg Config
-	)
-
-	cfg.LogLevel = p.logLevel("LOG_LEVEL")
-	cfg.ShutdownTimeout = p.duration("SHUTDOWN_TIMEOUT")
-	cfg.IdempotencyKeyTTL = p.durationOr("IDEMPOTENCY_KEY_TTL", 24*time.Hour)
-
-	cfg.HTTP = HTTP{
-		Addr:              p.string("HTTP_ADDR"),
-		ReadTimeout:       p.durationOr("HTTP_READ_TIMEOUT", 10*time.Second),
-		ReadHeaderTimeout: p.durationOr("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
-		WriteTimeout:      p.durationOr("HTTP_WRITE_TIMEOUT", 15*time.Second),
-		IdleTimeout:       p.durationOr("HTTP_IDLE_TIMEOUT", 60*time.Second),
-	}
-
-	cfg.DB = DB{
-		URL:             p.string("DATABASE_URL"),
-		MaxConns:        p.int32("DATABASE_MAX_CONNS"),
-		MinConns:        p.int32("DATABASE_MIN_CONNS"),
-		MaxConnLifetime: p.duration("DATABASE_MAX_CONN_LIFETIME"),
-		ConnectTimeout:  p.duration("DATABASE_CONNECT_TIMEOUT"),
-		QueryTimeout:    p.duration("DATABASE_QUERY_TIMEOUT"),
-	}
-
-	if cfg.DB.MinConns > cfg.DB.MaxConns {
-		p.errs = append(p.errs, errors.New("DATABASE_MIN_CONNS must not exceed DATABASE_MAX_CONNS"))
-	}
-
-	cfg.Telemetry = Telemetry{
-		ServiceName: p.stringOr("OTEL_SERVICE_NAME", "trip-service"),
-		Endpoint:    strings.TrimRight(p.string("OTEL_EXPORTER_OTLP_ENDPOINT"), "/"),
-	}
-
-	if protocol := p.stringOr("OTEL_EXPORTER_OTLP_PROTOCOL", otlpProtocolHTTP); protocol != otlpProtocolHTTP {
-		p.errs = append(p.errs, fmt.Errorf("OTEL_EXPORTER_OTLP_PROTOCOL must be %s, got %s", otlpProtocolHTTP, protocol))
-	}
-
-	if err := errors.Join(p.errs...); err != nil {
+	cfg, err := env.ParseAs[Config]()
+	if err != nil {
 		return Config{}, fmt.Errorf("invalid config: %w", err)
 	}
+
+	if err := validate(cfg); err != nil {
+		return Config{}, fmt.Errorf("invalid config: %w", err)
+	}
+
+	cfg.Telemetry.Endpoint = strings.TrimRight(cfg.Telemetry.Endpoint, "/")
 
 	return cfg, nil
 }
 
-type parser struct {
-	errs []error
-}
+func validate(cfg Config) error {
+	v := validator.New(validator.WithRequiredStructEnabled())
+	v.RegisterTagNameFunc(func(f reflect.StructField) string {
+		name, _, _ := strings.Cut(f.Tag.Get("env"), ",")
+		return name
+	})
 
-func (p *parser) lookup(key string) (string, bool) {
-	v, ok := os.LookupEnv(key)
-	if !ok || v == "" {
-		return "", false
-	}
+	err := v.Struct(cfg)
 
-	return v, true
-}
-
-func (p *parser) required(key string) (string, bool) {
-	v, ok := p.lookup(key)
+	fieldErrs, ok := errors.AsType[validator.ValidationErrors](err)
 	if !ok {
-		p.errs = append(p.errs, fmt.Errorf("%s is required", key))
+		return err
 	}
 
-	return v, ok
-}
-
-func (p *parser) string(key string) string {
-	v, _ := p.required(key)
-	return v
-}
-
-func (p *parser) stringOr(key, def string) string {
-	v, ok := p.lookup(key)
-	if !ok {
-		return def
+	errs := make([]error, 0, len(fieldErrs))
+	for _, fe := range fieldErrs {
+		errs = append(errs, fmt.Errorf("%s must satisfy %s %s", fe.Field(), fe.Tag(), fe.Param()))
 	}
 
-	return v
-}
-
-func (p *parser) duration(key string) time.Duration {
-	v, ok := p.required(key)
-	if !ok {
-		return 0
-	}
-
-	return p.parseDuration(key, v)
-}
-
-func (p *parser) durationOr(key string, def time.Duration) time.Duration {
-	v, ok := p.lookup(key)
-	if !ok {
-		return def
-	}
-
-	return p.parseDuration(key, v)
-}
-
-func (p *parser) parseDuration(key, v string) time.Duration {
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		p.errs = append(p.errs, fmt.Errorf("%s: %w", key, err))
-		return 0
-	}
-
-	if d <= 0 {
-		p.errs = append(p.errs, fmt.Errorf("%s must be positive, got %s", key, v))
-	}
-
-	return d
-}
-
-func (p *parser) int32(key string) int32 {
-	v, ok := p.required(key)
-	if !ok {
-		return 0
-	}
-
-	n, err := strconv.ParseInt(v, 10, 32)
-	if err != nil {
-		p.errs = append(p.errs, fmt.Errorf("%s: %w", key, err))
-		return 0
-	}
-
-	if n < 0 {
-		p.errs = append(p.errs, fmt.Errorf("%s must not be negative, got %d", key, n))
-	}
-
-	return int32(n)
-}
-
-func (p *parser) logLevel(key string) slog.Level {
-	v, ok := p.required(key)
-	if !ok {
-		return slog.LevelInfo
-	}
-
-	var lvl slog.Level
-	if err := lvl.UnmarshalText([]byte(v)); err != nil {
-		p.errs = append(p.errs, fmt.Errorf("%s: %w", key, err))
-	}
-
-	return lvl
+	return errors.Join(errs...)
 }

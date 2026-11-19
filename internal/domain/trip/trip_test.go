@@ -6,180 +6,210 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/domain/trip"
 )
 
-func validParams() trip.Params {
-	return trip.Params{
-		UserID:   uuid.New(),
-		DriverID: uuid.New(),
+var (
+	tripID     = uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	userID     = uuid.MustParse("00000000-0000-4000-8000-000000000002")
+	driverID   = uuid.MustParse("00000000-0000-4000-8000-000000000003")
+	startedAt  = time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	finishedAt = time.Date(2026, 8, 24, 12, 18, 0, 0, time.UTC)
+
+	emptyUser     = trip.FieldError{Field: "user_id", Message: "must not be empty"}
+	negativePrice = trip.FieldError{Field: "price", Message: "must be >= 0"}
+)
+
+func validParams(modify ...func(p *trip.Params)) trip.Params {
+	p := trip.Params{
+		UserID:   userID,
+		DriverID: driverID,
 		Start:    trip.Point{Latitude: 59.9398, Longitude: 30.3146},
 		End:      trip.Point{Latitude: 59.9290, Longitude: 30.3626},
 		Price:    1450,
 	}
+
+	for _, m := range modify {
+		m(&p)
+	}
+
+	return p
+}
+
+func errorIsValidation(t assert.TestingT, err error, msgAndArgs ...any) bool {
+	var validationErr *trip.ValidationError
+	return assert.ErrorAs(t, err, &validationErr, msgAndArgs...)
 }
 
 func TestNew(t *testing.T) {
-	t.Parallel()
-
-	id := uuid.New()
-	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
-	p := validParams()
-
-	got, err := trip.New(id, p, now)
-
-	require.NoError(t, err)
-	assert.Equal(t, trip.Trip{
-		ID:        id,
-		UserID:    p.UserID,
-		DriverID:  p.DriverID,
-		Start:     p.Start,
-		End:       p.End,
-		Price:     p.Price,
-		Status:    trip.StatusActive,
-		StartedAt: now,
-	}, got)
-}
-
-func TestNew_InvalidParams(t *testing.T) {
-	t.Parallel()
-
-	_, err := trip.New(uuid.New(), trip.Params{}, time.Now())
-
-	var validationErr *trip.ValidationError
-	require.ErrorAs(t, err, &validationErr)
-}
-
-func TestParamsValidate(t *testing.T) {
-	t.Parallel()
-
 	tests := []struct {
-		name   string
-		mutate func(p *trip.Params)
-		fields []string
+		name    string
+		in      trip.Params
+		want    trip.Trip
+		wantErr assert.ErrorAssertionFunc
 	}{
-		{name: "valid", mutate: func(*trip.Params) {}},
-		{name: "zero price is allowed", mutate: func(p *trip.Params) { p.Price = 0 }},
-		{name: "latitude on the boundary", mutate: func(p *trip.Params) { p.Start.Latitude = 90 }},
-		{name: "negative latitude on the boundary", mutate: func(p *trip.Params) { p.Start.Latitude = -90 }},
-		{name: "longitude on the boundary", mutate: func(p *trip.Params) { p.End.Longitude = 180 }},
-		{name: "negative longitude on the boundary", mutate: func(p *trip.Params) { p.End.Longitude = -180 }},
 		{
-			name:   "empty user",
-			mutate: func(p *trip.Params) { p.UserID = uuid.Nil },
-			fields: []string{"user_id"},
-		},
-		{
-			name:   "empty driver",
-			mutate: func(p *trip.Params) { p.DriverID = uuid.Nil },
-			fields: []string{"driver_id"},
-		},
-		{
-			name:   "negative price",
-			mutate: func(p *trip.Params) { p.Price = -1 },
-			fields: []string{"price"},
-		},
-		{
-			name:   "latitude above range",
-			mutate: func(p *trip.Params) { p.Start.Latitude = 90.1 },
-			fields: []string{"start_point.latitude"},
-		},
-		{
-			name:   "latitude below range",
-			mutate: func(p *trip.Params) { p.End.Latitude = -90.1 },
-			fields: []string{"end_point.latitude"},
-		},
-		{
-			name:   "longitude above range",
-			mutate: func(p *trip.Params) { p.End.Longitude = 180.1 },
-			fields: []string{"end_point.longitude"},
-		},
-		{
-			name:   "longitude below range",
-			mutate: func(p *trip.Params) { p.Start.Longitude = -180.1 },
-			fields: []string{"start_point.longitude"},
-		},
-		{
-			name: "all errors are reported together",
-			mutate: func(p *trip.Params) {
-				p.UserID = uuid.Nil
-				p.Price = -1
+			name: "успех, поездка создаётся активной",
+			in:   validParams(),
+			want: trip.Trip{
+				ID:        tripID,
+				UserID:    userID,
+				DriverID:  driverID,
+				Start:     trip.Point{Latitude: 59.9398, Longitude: 30.3146},
+				End:       trip.Point{Latitude: 59.9290, Longitude: 30.3626},
+				Price:     1450,
+				Status:    trip.StatusActive,
+				StartedAt: startedAt,
 			},
-			fields: []string{"user_id", "price"},
+			wantErr: assert.NoError,
+		},
+		{
+			name:    "ошибка валидации",
+			in:      trip.Params{},
+			want:    trip.Trip{},
+			wantErr: errorIsValidation,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+			got, err := trip.New(tripID, tt.in, startedAt)
 
-			p := validParams()
-			tt.mutate(&p)
-
-			err := p.Validate()
-
-			if tt.fields == nil {
-				require.NoError(t, err)
-				return
-			}
-
-			var validationErr *trip.ValidationError
-			require.ErrorAs(t, err, &validationErr)
-
-			fields := make([]string, 0, len(validationErr.Fields))
-			for _, f := range validationErr.Fields {
-				fields = append(fields, f.Field)
-				assert.Contains(t, err.Error(), f.Field+": "+f.Message)
-			}
-
-			assert.Equal(t, tt.fields, fields)
+			tt.wantErr(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
 
-func TestFinish(t *testing.T) {
-	t.Parallel()
-
-	startedAt := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
-	firstFinish := startedAt.Add(18 * time.Minute)
-
+func TestParams_Validate(t *testing.T) {
 	tests := []struct {
-		name           string
-		status         trip.Status
-		finishedAt     *time.Time
-		wantErr        error
-		wantStatus     trip.Status
-		wantFinishedAt *time.Time
+		name       string
+		in         trip.Params
+		wantFields []trip.FieldError
 	}{
 		{
-			name:           "active trip is completed",
-			status:         trip.StatusActive,
-			wantStatus:     trip.StatusCompleted,
-			wantFinishedAt: &firstFinish,
+			name: "успех",
+			in:   validParams(),
 		},
 		{
-			name:           "completed trip keeps its finished_at",
-			status:         trip.StatusCompleted,
-			finishedAt:     new(startedAt),
-			wantErr:        trip.ErrTripCompleted,
-			wantStatus:     trip.StatusCompleted,
-			wantFinishedAt: new(startedAt),
+			name: "нулевая цена допустима",
+			in:   validParams(func(p *trip.Params) { p.Price = 0 }),
+		},
+		{
+			name: "границы диапазонов координат допустимы",
+			in: validParams(func(p *trip.Params) {
+				p.Start = trip.Point{Latitude: 90, Longitude: 180}
+				p.End = trip.Point{Latitude: -90, Longitude: -180}
+			}),
+		},
+		{
+			name:       "пустой пользователь",
+			in:         validParams(func(p *trip.Params) { p.UserID = uuid.Nil }),
+			wantFields: []trip.FieldError{emptyUser},
+		},
+		{
+			name:       "пустой водитель",
+			in:         validParams(func(p *trip.Params) { p.DriverID = uuid.Nil }),
+			wantFields: []trip.FieldError{{Field: "driver_id", Message: "must not be empty"}},
+		},
+		{
+			name:       "отрицательная цена",
+			in:         validParams(func(p *trip.Params) { p.Price = -1 }),
+			wantFields: []trip.FieldError{negativePrice},
+		},
+		{
+			name:       "широта выше диапазона",
+			in:         validParams(func(p *trip.Params) { p.Start.Latitude = 90.1 }),
+			wantFields: []trip.FieldError{{Field: "start_point.latitude", Message: "must be <= 90"}},
+		},
+		{
+			name:       "широта ниже диапазона",
+			in:         validParams(func(p *trip.Params) { p.End.Latitude = -90.1 }),
+			wantFields: []trip.FieldError{{Field: "end_point.latitude", Message: "must be >= -90"}},
+		},
+		{
+			name:       "долгота выше диапазона",
+			in:         validParams(func(p *trip.Params) { p.End.Longitude = 180.1 }),
+			wantFields: []trip.FieldError{{Field: "end_point.longitude", Message: "must be <= 180"}},
+		},
+		{
+			name:       "долгота ниже диапазона",
+			in:         validParams(func(p *trip.Params) { p.Start.Longitude = -180.1 }),
+			wantFields: []trip.FieldError{{Field: "start_point.longitude", Message: "must be >= -180"}},
+		},
+		{
+			name: "все ошибки возвращаются вместе",
+			in: validParams(func(p *trip.Params) {
+				p.UserID = uuid.Nil
+				p.Price = -1
+			}),
+			wantFields: []trip.FieldError{
+				emptyUser,
+				negativePrice,
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+			err := tt.in.Validate()
 
-			tr := trip.Trip{Status: tt.status, StartedAt: startedAt, FinishedAt: tt.finishedAt}
+			if tt.wantFields == nil {
+				assert.NoError(t, err)
+				return
+			}
 
-			err := tr.Finish(firstFinish)
+			var validationErr *trip.ValidationError
+			if assert.ErrorAs(t, err, &validationErr) {
+				assert.Equal(t, tt.wantFields, validationErr.Fields)
+			}
+		})
+	}
+}
 
-			require.ErrorIs(t, err, tt.wantErr)
-			assert.Equal(t, tt.wantStatus, tr.Status)
-			assert.Equal(t, tt.wantFinishedAt, tr.FinishedAt)
+func TestValidationError_Error(t *testing.T) {
+	err := &trip.ValidationError{Fields: []trip.FieldError{
+		emptyUser,
+		negativePrice,
+	}}
+
+	assert.Equal(t, "user_id: must not be empty; price: must be >= 0", err.Error())
+}
+
+func TestTrip_Finish(t *testing.T) {
+	earlier := startedAt.Add(time.Minute)
+
+	tests := []struct {
+		name    string
+		in      trip.Trip
+		want    trip.Trip
+		wantErr assert.ErrorAssertionFunc
+	}{
+		{
+			name:    "успех, активная поездка завершается",
+			in:      trip.Trip{ID: tripID, Status: trip.StatusActive},
+			want:    trip.Trip{ID: tripID, Status: trip.StatusCompleted, FinishedAt: &finishedAt},
+			wantErr: assert.NoError,
+		},
+		{
+			name: "ошибка, поездка уже завершена, finished_at не меняется",
+			in:   trip.Trip{ID: tripID, Status: trip.StatusCompleted, FinishedAt: &earlier},
+			want: trip.Trip{ID: tripID, Status: trip.StatusCompleted, FinishedAt: &earlier},
+			wantErr: func(t assert.TestingT, err error, msgAndArgs ...any) bool {
+				return assert.ErrorIs(t, err, trip.ErrTripCompleted, msgAndArgs...)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.in
+
+			err := got.Finish(finishedAt)
+
+			tt.wantErr(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

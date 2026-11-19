@@ -1,10 +1,7 @@
 package create_test
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,7 +10,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/api"
@@ -23,152 +19,195 @@ import (
 )
 
 const validBody = `{
-	"user_id": "5cb72c04-7650-45c9-a79b-bcdba0631e0c",
-	"driver_id": "8860b315-ec86-42eb-a17c-7c163d721ff5",
+	"user_id": "00000000-0000-4000-8000-000000000002",
+	"driver_id": "00000000-0000-4000-8000-000000000003",
 	"start_point": {"latitude": 59.9398, "longitude": 30.3146},
-	"end_point": {"latitude": 59.9290, "longitude": 30.3626},
+	"end_point": {"latitude": 59.929, "longitude": 30.3626},
 	"price": 1450
 }`
 
-func perform(t *testing.T, mock *Mockusecase, body string, params api.CreateTripParams) *httptest.ResponseRecorder {
-	t.Helper()
+const createdJSON = `{
+	"id": "00000000-0000-4000-8000-000000000001",
+	"user_id": "00000000-0000-4000-8000-000000000002",
+	"driver_id": "00000000-0000-4000-8000-000000000003",
+	"start_point": {"latitude": 59.9398, "longitude": 30.3146},
+	"end_point": {"latitude": 59.929, "longitude": 30.3626},
+	"price": 1450,
+	"status": "active",
+	"started_at": "2026-08-24T12:00:00Z",
+	"finished_at": null,
+	"last_position_at": null
+}`
 
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(body))
+const codeInvalidRequest = "invalid_request"
 
-	create.New(mock, slog.New(slog.DiscardHandler)).Handle(rec, req, params)
-
-	return rec
+type mocks struct {
+	usecase *Mockusecase
+	log     *Mocklogger
 }
 
-func decodeProblem(t *testing.T, rec *httptest.ResponseRecorder) api.Problem {
+func TestHandler_Handle(t *testing.T) {
+	key := uuid.MustParse("00000000-0000-4000-8000-000000000004")
+	params := trip.Params{
+		UserID:   uuid.MustParse("00000000-0000-4000-8000-000000000002"),
+		DriverID: uuid.MustParse("00000000-0000-4000-8000-000000000003"),
+		Start:    trip.Point{Latitude: 59.9398, Longitude: 30.3146},
+		End:      trip.Point{Latitude: 59.929, Longitude: 30.3626},
+		Price:    1450,
+	}
+	created := trip.Trip{
+		ID:        uuid.MustParse("00000000-0000-4000-8000-000000000001"),
+		UserID:    params.UserID,
+		DriverID:  params.DriverID,
+		Start:     params.Start,
+		End:       params.End,
+		Price:     params.Price,
+		Status:    trip.StatusActive,
+		StartedAt: time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC),
+	}
+	location := "/api/v1/trips/" + created.ID.String()
+
+	tests := []struct {
+		name         string
+		setup        func(m mocks)
+		body         string
+		params       api.CreateTripParams
+		wantStatus   int
+		wantBody     string
+		wantCode     string
+		wantLocation string
+	}{
+		{
+			name: "успех, поездка создана",
+			setup: func(m mocks) {
+				m.usecase.EXPECT().Do(gomock.Any(), model.CreateTripInput{Params: params}).
+					Return(model.CreateTripResult{Trip: created}, nil)
+			},
+			body:         validBody,
+			wantStatus:   http.StatusCreated,
+			wantBody:     createdJSON,
+			wantLocation: location,
+		},
+		{
+			name: "повтор с тем же ключом идемпотентности → 200",
+			setup: func(m mocks) {
+				m.usecase.EXPECT().Do(gomock.Any(), model.CreateTripInput{Params: params, IdempotencyKey: &key}).
+					Return(model.CreateTripResult{Trip: created, Replayed: true}, nil)
+			},
+			body:         validBody,
+			params:       api.CreateTripParams{IdempotencyKey: &key},
+			wantStatus:   http.StatusOK,
+			wantBody:     createdJSON,
+			wantLocation: location,
+		},
+		{
+			name:       "невалидный JSON → 400",
+			setup:      func(mocks) {},
+			body:       `{"user_id":`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   codeInvalidRequest,
+		},
+		{
+			name:       "неизвестное поле → 400",
+			setup:      func(mocks) {},
+			body:       `{"surge": true}`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   codeInvalidRequest,
+		},
+		{
+			name:       "поле неверного типа → 400",
+			setup:      func(mocks) {},
+			body:       `{"price": "free"}`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   codeInvalidRequest,
+		},
+		{
+			name:       "невалидный uuid → 400",
+			setup:      func(mocks) {},
+			body:       `{"user_id": "not-a-uuid"}`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   codeInvalidRequest,
+		},
+		{
+			name:       "два объекта в теле → 400",
+			setup:      func(mocks) {},
+			body:       validBody + validBody,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   codeInvalidRequest,
+		},
+		{
+			name: "ошибка валидации в домене → 400",
+			setup: func(m mocks) {
+				m.usecase.EXPECT().Do(gomock.Any(), gomock.Any()).
+					Return(model.CreateTripResult{}, &trip.ValidationError{Fields: []trip.FieldError{{Field: "user_id", Message: "must not be empty"}}})
+			},
+			body:       validBody,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   codeInvalidRequest,
+		},
+		{
+			name: "водитель занят → 409",
+			setup: func(m mocks) {
+				m.usecase.EXPECT().Do(gomock.Any(), gomock.Any()).Return(model.CreateTripResult{}, trip.ErrDriverBusy)
+			},
+			body:       validBody,
+			wantStatus: http.StatusConflict,
+			wantCode:   "driver_busy",
+		},
+		{
+			name: "ключ идемпотентности с другим телом → 409",
+			setup: func(m mocks) {
+				m.usecase.EXPECT().Do(gomock.Any(), gomock.Any()).Return(model.CreateTripResult{}, trip.ErrIdempotencyConflict)
+			},
+			body:       validBody,
+			wantStatus: http.StatusConflict,
+			wantCode:   "idempotency_conflict",
+		},
+		{
+			name: "ошибка репозитория → 500 без деталей, ошибка в логе",
+			setup: func(m mocks) {
+				m.usecase.EXPECT().Do(gomock.Any(), gomock.Any()).Return(model.CreateTripResult{}, assert.AnError)
+				m.log.EXPECT().ErrorContext(gomock.Any(), "request failed", gomock.Any())
+			},
+			body:       validBody,
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "internal_error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			m := mocks{usecase: NewMockusecase(ctrl), log: NewMocklogger(ctrl)}
+			tt.setup(m)
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(tt.body))
+
+			create.New(m.usecase, m.log).Handle(rec, req, tt.params)
+
+			assert.Equal(t, tt.wantStatus, rec.Code)
+			assert.Equal(t, tt.wantLocation, rec.Header().Get("Location"))
+			assert.NotContains(t, rec.Body.String(), assert.AnError.Error())
+			assertBody(t, rec, tt.wantBody, tt.wantCode)
+		})
+	}
+}
+
+func assertBody(t *testing.T, rec *httptest.ResponseRecorder, wantBody, wantCode string) {
 	t.Helper()
+
+	if wantCode == "" {
+		assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+		assert.JSONEq(t, wantBody, rec.Body.String())
+
+		return
+	}
 
 	assert.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"))
 
 	var problem api.Problem
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &problem))
-
-	return problem
-}
-
-func TestHandle_Created(t *testing.T) {
-	t.Parallel()
-
-	created := trip.Trip{
-		ID:        uuid.New(),
-		Status:    trip.StatusActive,
-		StartedAt: time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC),
-	}
-
-	mock := NewMockusecase(gomock.NewController(t))
-	mock.EXPECT().Do(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, in model.CreateTripInput) (model.CreateTripResult, error) {
-			assert.Equal(t, uuid.MustParse("5cb72c04-7650-45c9-a79b-bcdba0631e0c"), in.Params.UserID)
-			assert.Equal(t, uuid.MustParse("8860b315-ec86-42eb-a17c-7c163d721ff5"), in.Params.DriverID)
-			assert.Equal(t, trip.Point{Latitude: 59.9398, Longitude: 30.3146}, in.Params.Start)
-			assert.Equal(t, trip.Point{Latitude: 59.9290, Longitude: 30.3626}, in.Params.End)
-			assert.Equal(t, int64(1450), in.Params.Price)
-			assert.Nil(t, in.IdempotencyKey)
-
-			return model.CreateTripResult{Trip: created}, nil
-		})
-
-	rec := perform(t, mock, validBody, api.CreateTripParams{})
-
-	assert.Equal(t, http.StatusCreated, rec.Code)
-	assert.Equal(t, "/api/v1/trips/"+created.ID.String(), rec.Header().Get("Location"))
-	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-
-	var got map[string]any
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
-	assert.Equal(t, created.ID.String(), got["id"])
-	assert.Equal(t, "active", got["status"])
-	assert.Contains(t, got, "finished_at")
-	assert.Nil(t, got["finished_at"])
-}
-
-func TestHandle_Replayed_ReturnsOK(t *testing.T) {
-	t.Parallel()
-
-	key := uuid.New()
-	existing := trip.Trip{ID: uuid.New(), Status: trip.StatusActive}
-
-	mock := NewMockusecase(gomock.NewController(t))
-	mock.EXPECT().Do(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, in model.CreateTripInput) (model.CreateTripResult, error) {
-			assert.Equal(t, &key, in.IdempotencyKey)
-			return model.CreateTripResult{Trip: existing, Replayed: true}, nil
-		})
-
-	rec := perform(t, mock, validBody, api.CreateTripParams{IdempotencyKey: &key})
-
-	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, "/api/v1/trips/"+existing.ID.String(), rec.Header().Get("Location"))
-}
-
-func TestHandle_InvalidBody(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		body string
-	}{
-		{name: "not a json", body: `{"user_id":`},
-		{name: "unknown field", body: `{"surge": true}`},
-		{name: "wrong type", body: `{"price": "free"}`},
-		{name: "two objects", body: validBody + validBody},
-		{name: "invalid uuid", body: `{"user_id": "not-a-uuid"}`},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			mock := NewMockusecase(gomock.NewController(t))
-
-			rec := perform(t, mock, tt.body, api.CreateTripParams{})
-
-			assert.Equal(t, http.StatusBadRequest, rec.Code)
-			assert.Equal(t, "invalid_request", decodeProblem(t, rec).Code)
-		})
-	}
-}
-
-func TestHandle_UsecaseErrors(t *testing.T) {
-	t.Parallel()
-
-	const dbDetails = "dial tcp 10.0.0.1:5432: connection refused"
-
-	tests := []struct {
-		name       string
-		err        error
-		wantStatus int
-		wantCode   string
-	}{
-		{name: "driver busy", err: trip.ErrDriverBusy, wantStatus: http.StatusConflict, wantCode: "driver_busy"},
-		{name: "idempotency conflict", err: trip.ErrIdempotencyConflict, wantStatus: http.StatusConflict, wantCode: "idempotency_conflict"},
-		{
-			name:       "validation",
-			err:        &trip.ValidationError{Fields: []trip.FieldError{{Field: "user_id", Message: "must not be empty"}}},
-			wantStatus: http.StatusBadRequest,
-			wantCode:   "invalid_request",
-		},
-		{name: "repository failure", err: errors.New(dbDetails), wantStatus: http.StatusInternalServerError, wantCode: "internal_error"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			mock := NewMockusecase(gomock.NewController(t))
-			mock.EXPECT().Do(gomock.Any(), gomock.Any()).Return(model.CreateTripResult{}, tt.err)
-
-			rec := perform(t, mock, validBody, api.CreateTripParams{})
-
-			assert.Equal(t, tt.wantStatus, rec.Code)
-			assert.Equal(t, tt.wantCode, decodeProblem(t, rec).Code)
-			assert.NotContains(t, rec.Body.String(), dbDetails)
-		})
+	if assert.NoError(t, json.Unmarshal(rec.Body.Bytes(), &problem)) {
+		assert.Equal(t, wantCode, problem.Code)
 	}
 }

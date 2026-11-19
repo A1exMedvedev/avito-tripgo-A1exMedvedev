@@ -3,6 +3,12 @@ package health
 
 import "context"
 
-type pinger interface {
-	Ping(ctx context.Context) error
-}
+type (
+	pinger interface {
+		Ping(ctx context.Context) error
+	}
+
+	logger interface {
+		WarnContext(ctx context.Context, msg string, args ...any)
+	}
+)

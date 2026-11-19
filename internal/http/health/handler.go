@@ -13,10 +13,10 @@ import (
 type Handler struct {
 	db           pinger
 	readyTimeout time.Duration
-	log          *slog.Logger
+	log          logger
 }
 
-func New(db pinger, readyTimeout time.Duration, log *slog.Logger) *Handler {
+func New(db pinger, readyTimeout time.Duration, log logger) *Handler {
 	return &Handler{db: db, readyTimeout: readyTimeout, log: log}
 }
 

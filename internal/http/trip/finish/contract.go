@@ -9,6 +9,12 @@ import (
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/domain/trip"
 )
 
-type usecase interface {
-	Do(ctx context.Context, id uuid.UUID) (trip.Trip, error)
-}
+type (
+	usecase interface {
+		Do(ctx context.Context, id uuid.UUID) (trip.Trip, error)
+	}
+
+	logger interface {
+		ErrorContext(ctx context.Context, msg string, args ...any)
+	}
+)

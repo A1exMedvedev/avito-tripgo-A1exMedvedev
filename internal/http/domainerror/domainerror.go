@@ -60,7 +60,7 @@ func InvalidRequest(detail string) api.Problem {
 	return invalidRequest.problem(detail)
 }
 
-func Write(w http.ResponseWriter, r *http.Request, log *slog.Logger, err error) {
+func Write(w http.ResponseWriter, r *http.Request, log logger, err error) {
 	status, body := Problem(err)
 
 	if status >= http.StatusInternalServerError {

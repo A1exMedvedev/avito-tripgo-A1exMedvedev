@@ -12,7 +12,6 @@ package create_test
 import (
 	context "context"
 	reflect "reflect"
-	time "time"
 
 	trip "github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/domain/trip"
 	model "github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/model"
@@ -87,58 +86,44 @@ func (mr *MocktripRepositoryMockRecorder) SaveStatusChange(ctx, c any) *gomock.C
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SaveStatusChange", reflect.TypeOf((*MocktripRepository)(nil).SaveStatusChange), ctx, c)
 }
 
-// MockidempotencyRepository is a mock of idempotencyRepository interface.
-type MockidempotencyRepository struct {
+// Mockidempotency is a mock of idempotency interface.
+type Mockidempotency struct {
 	ctrl     *gomock.Controller
-	recorder *MockidempotencyRepositoryMockRecorder
+	recorder *MockidempotencyMockRecorder
 	isgomock struct{}
 }
 
-// MockidempotencyRepositoryMockRecorder is the mock recorder for MockidempotencyRepository.
-type MockidempotencyRepositoryMockRecorder struct {
-	mock *MockidempotencyRepository
+// MockidempotencyMockRecorder is the mock recorder for Mockidempotency.
+type MockidempotencyMockRecorder struct {
+	mock *Mockidempotency
 }
 
-// NewMockidempotencyRepository creates a new mock instance.
-func NewMockidempotencyRepository(ctrl *gomock.Controller) *MockidempotencyRepository {
-	mock := &MockidempotencyRepository{ctrl: ctrl}
-	mock.recorder = &MockidempotencyRepositoryMockRecorder{mock}
+// NewMockidempotency creates a new mock instance.
+func NewMockidempotency(ctrl *gomock.Controller) *Mockidempotency {
+	mock := &Mockidempotency{ctrl: ctrl}
+	mock.recorder = &MockidempotencyMockRecorder{mock}
 	return mock
 }
 
 // EXPECT returns an object that allows the caller to indicate expected use.
-func (m *MockidempotencyRepository) EXPECT() *MockidempotencyRepositoryMockRecorder {
+func (m *Mockidempotency) EXPECT() *MockidempotencyMockRecorder {
 	return m.recorder
 }
 
-// ClaimIdempotencyKey mocks base method.
-func (m *MockidempotencyRepository) ClaimIdempotencyKey(ctx context.Context, k model.IdempotencyKey, expiredBefore time.Time) (bool, error) {
+// Claim mocks base method.
+func (m *Mockidempotency) Claim(ctx context.Context, k model.IdempotencyKey) (uuid.UUID, bool, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ClaimIdempotencyKey", ctx, k, expiredBefore)
-	ret0, _ := ret[0].(bool)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
+	ret := m.ctrl.Call(m, "Claim", ctx, k)
+	ret0, _ := ret[0].(uuid.UUID)
+	ret1, _ := ret[1].(bool)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
 }
 
-// ClaimIdempotencyKey indicates an expected call of ClaimIdempotencyKey.
-func (mr *MockidempotencyRepositoryMockRecorder) ClaimIdempotencyKey(ctx, k, expiredBefore any) *gomock.Call {
+// Claim indicates an expected call of Claim.
+func (mr *MockidempotencyMockRecorder) Claim(ctx, k any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ClaimIdempotencyKey", reflect.TypeOf((*MockidempotencyRepository)(nil).ClaimIdempotencyKey), ctx, k, expiredBefore)
-}
-
-// FetchIdempotencyKey mocks base method.
-func (m *MockidempotencyRepository) FetchIdempotencyKey(ctx context.Context, key uuid.UUID) (model.IdempotencyKey, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "FetchIdempotencyKey", ctx, key)
-	ret0, _ := ret[0].(model.IdempotencyKey)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// FetchIdempotencyKey indicates an expected call of FetchIdempotencyKey.
-func (mr *MockidempotencyRepositoryMockRecorder) FetchIdempotencyKey(ctx, key any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FetchIdempotencyKey", reflect.TypeOf((*MockidempotencyRepository)(nil).FetchIdempotencyKey), ctx, key)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Claim", reflect.TypeOf((*Mockidempotency)(nil).Claim), ctx, k)
 }
 
 // MocktxManager is a mock of txManager interface.
@@ -213,4 +198,45 @@ func (m *Mockmetrics) TripCreated(ctx context.Context) {
 func (mr *MockmetricsMockRecorder) TripCreated(ctx any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TripCreated", reflect.TypeOf((*Mockmetrics)(nil).TripCreated), ctx)
+}
+
+// Mocklogger is a mock of logger interface.
+type Mocklogger struct {
+	ctrl     *gomock.Controller
+	recorder *MockloggerMockRecorder
+	isgomock struct{}
+}
+
+// MockloggerMockRecorder is the mock recorder for Mocklogger.
+type MockloggerMockRecorder struct {
+	mock *Mocklogger
+}
+
+// NewMocklogger creates a new mock instance.
+func NewMocklogger(ctrl *gomock.Controller) *Mocklogger {
+	mock := &Mocklogger{ctrl: ctrl}
+	mock.recorder = &MockloggerMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *Mocklogger) EXPECT() *MockloggerMockRecorder {
+	return m.recorder
+}
+
+// InfoContext mocks base method.
+func (m *Mocklogger) InfoContext(ctx context.Context, msg string, args ...any) {
+	m.ctrl.T.Helper()
+	varargs := []any{ctx, msg}
+	for _, a := range args {
+		varargs = append(varargs, a)
+	}
+	m.ctrl.Call(m, "InfoContext", varargs...)
+}
+
+// InfoContext indicates an expected call of InfoContext.
+func (mr *MockloggerMockRecorder) InfoContext(ctx, msg any, args ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{ctx, msg}, args...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "InfoContext", reflect.TypeOf((*Mocklogger)(nil).InfoContext), varargs...)
 }

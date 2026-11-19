@@ -24,4 +24,8 @@ type (
 	metrics interface {
 		TripCompleted(ctx context.Context)
 	}
+
+	logger interface {
+		InfoContext(ctx context.Context, msg string, args ...any)
+	}
 )

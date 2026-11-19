@@ -7,6 +7,12 @@ import (
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/model"
 )
 
-type usecase interface {
-	Do(ctx context.Context, in model.CreateTripInput) (model.CreateTripResult, error)
-}
+type (
+	usecase interface {
+		Do(ctx context.Context, in model.CreateTripInput) (model.CreateTripResult, error)
+	}
+
+	logger interface {
+		ErrorContext(ctx context.Context, msg string, args ...any)
+	}
+)

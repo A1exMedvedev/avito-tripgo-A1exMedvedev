@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/infra/postgres/transaction"
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/infra/telemetry"
 	triprepo "github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/repository/trip"
+	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/service/idempotency"
 	usecasecreate "github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/usecase/trip/create"
 	usecasefinish "github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/usecase/trip/finish"
 	usecaseget "github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/usecase/trip/get"
@@ -95,7 +97,7 @@ func newHandler(cfg config.Config, log *slog.Logger, tel *telemetry.Telemetry, p
 
 	return router.New(
 		router.Handlers{
-			Create: httpcreate.New(usecasecreate.New(trips, trips, txManager, metrics, log, now, cfg.IdempotencyKeyTTL), log),
+			Create: httpcreate.New(usecasecreate.New(trips, idempotency.New(trips, cfg.IdempotencyKeyTTL), txManager, metrics, log, now, uuid.NewV7), log),
 			Get:    httpget.New(usecaseget.New(trips), log),
 			Finish: httpfinish.New(usecasefinish.New(trips, txManager, metrics, log, now), log),
 			Health: health.New(pool, cfg.DB.QueryTimeout, log),

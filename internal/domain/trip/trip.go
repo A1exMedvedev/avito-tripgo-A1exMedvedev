@@ -1,8 +1,13 @@
 package trip
 
 import (
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
 	"time"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
 )
 
@@ -14,8 +19,8 @@ const (
 )
 
 type Point struct {
-	Latitude  float64
-	Longitude float64
+	Latitude  float64 `field:"latitude"  validate:"gte=-90,lte=90"`
+	Longitude float64 `field:"longitude" validate:"gte=-180,lte=180"`
 }
 
 type Trip struct {
@@ -31,11 +36,22 @@ type Trip struct {
 }
 
 type Params struct {
-	UserID   uuid.UUID
-	DriverID uuid.UUID
-	Start    Point
-	End      Point
-	Price    int64
+	UserID   uuid.UUID `field:"user_id"     validate:"required"`
+	DriverID uuid.UUID `field:"driver_id"   validate:"required"`
+	Start    Point     `field:"start_point"`
+	End      Point     `field:"end_point"`
+	Price    int64     `field:"price"       validate:"gte=0"`
+}
+
+var validate = newValidator()
+
+func newValidator() *validator.Validate {
+	v := validator.New(validator.WithRequiredStructEnabled())
+	v.RegisterTagNameFunc(func(f reflect.StructField) string {
+		return f.Tag.Get("field")
+	})
+
+	return v
 }
 
 func New(id uuid.UUID, p Params, startedAt time.Time) (Trip, error) {
@@ -67,40 +83,34 @@ func (t *Trip) Finish(at time.Time) error {
 }
 
 func (p Params) Validate() error {
-	var fields []FieldError
-
-	if p.UserID == uuid.Nil {
-		fields = append(fields, FieldError{"user_id", "must not be empty"})
+	err := validate.Struct(p)
+	if err == nil {
+		return nil
 	}
 
-	if p.DriverID == uuid.Nil {
-		fields = append(fields, FieldError{"driver_id", "must not be empty"})
+	fieldErrs, ok := errors.AsType[validator.ValidationErrors](err)
+	if !ok {
+		return fmt.Errorf("validate trip params: %w", err)
 	}
 
-	fields = append(fields, validatePoint("start_point", p.Start)...)
-	fields = append(fields, validatePoint("end_point", p.End)...)
-
-	if p.Price < 0 {
-		fields = append(fields, FieldError{"price", "must not be negative"})
+	fields := make([]FieldError, 0, len(fieldErrs))
+	for _, fe := range fieldErrs {
+		_, field, _ := strings.Cut(fe.Namespace(), ".")
+		fields = append(fields, FieldError{Field: field, Message: message(fe)})
 	}
 
-	if len(fields) > 0 {
-		return &ValidationError{Fields: fields}
-	}
-
-	return nil
+	return &ValidationError{Fields: fields}
 }
 
-func validatePoint(name string, p Point) []FieldError {
-	var fields []FieldError
-
-	if p.Latitude < -90 || p.Latitude > 90 {
-		fields = append(fields, FieldError{name + ".latitude", "must be in [-90, 90]"})
+func message(fe validator.FieldError) string {
+	switch fe.Tag() {
+	case "required":
+		return "must not be empty"
+	case "gte":
+		return "must be >= " + fe.Param()
+	case "lte":
+		return "must be <= " + fe.Param()
+	default:
+		return "is invalid"
 	}
-
-	if p.Longitude < -180 || p.Longitude > 180 {
-		fields = append(fields, FieldError{name + ".longitude", "must be in [-180, 180]"})
-	}
-
-	return fields
 }

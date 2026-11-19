@@ -51,8 +51,12 @@ make run                       # сервис на $HTTP_ADDR (по умолча
 
 ## Переменные окружения
 
-Все обязательные переменные проверяются на старте. Если какой-то нет, сервис
-не запускается и перечисляет, чего не хватает. Пример — [`.env.example`](.env.example).
+Конфиг читает библиотека [`caarlos0/env`](https://github.com/caarlos0/env): имя переменной,
+обязательность и значение по умолчанию записаны в тегах структуры `internal/config.Config`.
+Ограничения на значения (положительные таймауты, `DATABASE_MIN_CONNS <= DATABASE_MAX_CONNS`,
+допустимый протокол) проверяет `go-playground/validator` по тегам `validate`. Если
+переменной нет или значение неверное, сервис не запускается и перечисляет все ошибки
+сразу. Пример — [`.env.example`](.env.example).
 
 | Переменная | Обязательна | Пример | Что задаёт |
 |---|---|---|---|
@@ -129,9 +133,10 @@ http/*   usecase/*   repository/*  ──► infra/postgres
 | `cmd/trip-service` | читает конфиг, зовёт `container.New`, ждёт сигнала | `config`, `container` |
 | `internal/config` | разбор и проверка переменных окружения | ничего |
 | `internal/container` | создаёт реализации и связывает их | все пакеты |
-| `internal/domain/trip` | поездка, статусы и переход `Finish`, правила, ошибки | ничего |
+| `internal/domain/trip` | поездка, статусы и переход `Finish`, правила валидации в тегах, ошибки | `validator` |
 | `internal/model` | структуры, которые ходят между слоями | домен |
 | `internal/usecase/trip/{create,get,finish}` | сценарии: транзакции, бизнес-логи, бизнес-метрики | домен, `model` |
+| `internal/service/idempotency` | занятие ключа идемпотентности, срок жизни ключа, сравнение отпечатков | домен, `model` |
 | `internal/http/trip/{create,get,finish}` | разбор запроса и ответ, по пакету на ручку | домен, `model`, `api` |
 | `internal/http/health` | `/health` и `/ready` | `api` |
 | `internal/http/domainerror` | единственный маппинг ошибки в `Problem` | домен, `api` |
@@ -150,6 +155,16 @@ http/*   usecase/*   repository/*  ──► infra/postgres
 Поэтому интерфейсы узкие: `usecase/trip/get` просит только `Fetch`, хотя `repository/trip.Repo`
 умеет больше. Моки генерирует `mockgen` в `mocks_test.go` рядом с кодом.
 
+Логгер тоже зависимость за интерфейсом: каждый потребитель объявляет только нужные ему
+методы (`InfoContext` у usecase, `ErrorContext` у хендлеров, `WarnContext` у `/ready`,
+`LogAttrs` у middleware). `*slog.Logger` им подходит, но его можно заменить, не трогая
+потребителей, а в тестах подставить мок и проверить, что событие действительно записано.
+
+Логика идемпотентности вынесена из usecase создания в `internal/service/idempotency`.
+Usecase только решает, когда занимать ключ, и считает отпечаток параметров поездки, а
+сервис отвечает за срок жизни ключа и за сравнение отпечатков. Так её можно
+переиспользовать для других ручек и тестировать отдельно.
+
 Что изменится со вторым транспортом в ЛР4: появится `internal/grpc/trip/...` со своими
 интерфейсами на те же usecase и свой маппинг ошибок в коды gRPC. Usecase, домен и
 репозитории не меняются, в `container` добавляется сборка сервера.
@@ -163,6 +178,7 @@ http/*   usecase/*   repository/*  ──► infra/postgres
   нет места в пакете одной ручки, а `/health` и `/ready` не относятся к поездкам.
 - `convert.go` есть только у `http/trip/create`. Перевод поездки в ответ один на три ручки,
   он лежит в `http/response/trip.go`, чтобы не копировать его трижды.
+- Добавлен `internal/service/idempotency`: это общая логика, а не сценарий одной ручки.
 - Правила пакета на действие и инфраструктуры отдельно от бизнес-логики соблюдены.
 
 ## Тесты
@@ -170,22 +186,28 @@ http/*   usecase/*   repository/*  ──► infra/postgres
 | Что | Где | Чем |
 |---|---|---|
 | Домен: `Finish`, валидация | `internal/domain/trip` | table-driven, без моков |
-| Usecase | `internal/usecase/trip/*` | `gomock` на репозиторий, `txManager`, метрики |
+| Usecase | `internal/usecase/trip/*` | `gomock` на репозиторий, `txManager`, метрики, логгер |
+| Сервис идемпотентности | `internal/service/idempotency` | `gomock` на репозиторий |
 | Маппинг ошибок | `internal/http/domainerror` | table-driven |
-| Хендлеры | `internal/http/trip/*`, `internal/http/health` | `httptest` + мок usecase |
+| Хендлеры | `internal/http/trip/*`, `internal/http/health` | `httptest` + моки usecase и логгера |
 | Репозиторий, транзакции | `internal/repository/trip` | настоящий PostgreSQL, тег `integration` |
 
-Где искать обязательные сценарии:
+Unit-тесты написаны в одном стиле: один табличный тест на функцию, у каждого сценария
+своя функция `setup`, которая задаёт поведение моков, ожидаемый результат и
+`wantErr assert.ErrorAssertionFunc`. Контроллер gomock создаётся заново на каждый сценарий,
+поэтому неожиданный вызов мока, например лишняя запись в лог, роняет тест.
+
+Где искать обязательные сценарии (подтест — имя сценария в таблице):
 
 | Сценарий | Тест |
 |---|---|
-| создание — успех | `usecase/trip/create: TestDo_Success`, `http/trip/create: TestHandle_Created` |
-| занятый водитель → `409` | `usecase/trip/create: TestDo_DriverBusy`, `http/trip/create: TestHandle_UsecaseErrors`, `repository/trip: TestSave_DriverBusy` |
-| завершение активной — успех | `usecase/trip/finish: TestDo_ActiveTrip`, `http/trip/finish: TestHandle_OK` |
-| завершение завершённой → `409` | `domain/trip: TestFinish`, `usecase/trip/finish: TestDo_CompletedTrip_NothingIsWritten`, `http/trip/finish: TestHandle_Errors` |
-| несуществующая → `404` | `usecase/trip/get: TestDo`, `http/trip/get: TestHandle_NotFound` |
-| невалидное тело → `400 invalid_request` | `http/trip/create: TestHandle_InvalidBody` |
-| ошибка репозитория → `500` без деталей | `http/trip/get: TestHandle_RepositoryFailure_HidesDetails`, `http/domainerror: TestWrite` |
+| создание — успех | `usecase/trip/create: TestUsecase_Do/успех без ключа идемпотентности`, `http/trip/create: TestHandler_Handle/успех, поездка создана` |
+| занятый водитель → `409` | `usecase/trip/create: TestUsecase_Do/ошибка, водитель занят`, `http/trip/create: TestHandler_Handle/водитель занят → 409`, `repository/trip: TestSave_DriverBusy` |
+| завершение активной — успех | `usecase/trip/finish: TestUsecase_Do/успех, активная поездка завершена`, `http/trip/finish: TestHandler_Handle/успех` |
+| завершение завершённой → `409` | `domain/trip: TestTrip_Finish`, `usecase/trip/finish: TestUsecase_Do/ошибка, поездка уже завершена…`, `http/trip/finish: TestHandler_Handle/поездка уже завершена → 409` |
+| несуществующая → `404` | `usecase/trip/get: TestUsecase_Do/ошибка, поездка не найдена`, `http/trip/get: TestHandler_Handle/поездка не найдена → 404` |
+| невалидное тело → `400 invalid_request` | `http/trip/create: TestHandler_Handle/невалидный JSON → 400` и соседние сценарии |
+| ошибка репозитория → `500` без деталей | `http/trip/*: TestHandler_Handle/ошибка репозитория → 500 без деталей…`, `http/domainerror: TestWrite` |
 | откат `INSERT` в двух таблицах | `repository/trip: TestTransaction_RollbackRevertsBothTables` |
 
 Интеграционные тесты сами поднимают контейнер с PostgreSQL и накатывают миграции. Каждый
@@ -321,6 +343,9 @@ CREATE UNIQUE INDEX trips_driver_id_active_uniq ON trips (driver_id) WHERE statu
 | повтор с тем же ключом и тем же телом | `200` и та же поездка, вторая не создаётся |
 | тот же ключ, другое тело | `409 idempotency_conflict` |
 
+- **Где логика.** `internal/service/idempotency.Service.Claim`: занимает ключ, а если он уже
+  занят, сравнивает отпечаток и возвращает id созданной поездки или
+  `ErrIdempotencyConflict`. Usecase создания вызывает его внутри своей транзакции.
 - **Хранение.** Таблица `idempotency_keys` (миграция `00003`): ключ, sha256-отпечаток
   запроса, `trip_id`, время создания. Отпечаток считается по разобранным
   параметрам, а не по сырому телу, поэтому пробелы и порядок полей в JSON на него
@@ -355,6 +380,11 @@ CREATE UNIQUE INDEX trips_driver_id_active_uniq ON trips (driver_id) WHERE statu
 передаёт ошибку туда, не разбирая. Неизвестная ошибка становится `500` с общим
 текстом. Подробности пишутся в лог и в спан, клиент их не видит. Запись в лог делает
 только `domainerror.Write` и только для 5xx, поэтому одна ошибка логируется один раз.
+
+Правила валидации записаны тегами `validate` прямо на `trip.Params` и `trip.Point` и
+проверяются `go-playground/validator`. Тег `field` задаёт имя поля в ошибке, такое же, как
+в API: `start_point.latitude`, а не `Start.Latitude`. Валидатор создаётся один раз на пакет:
+библиотека рассчитана на это, потокобезопасна и кеширует разбор структур.
 
 ### Телеметрия
 

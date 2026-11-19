@@ -1,9 +1,3 @@
-# Пример конфига golangci-lint для сервиса курса.
-# Скопируйте в корень своего репозитория как .golangci.yml.
-#
-# За основу взят обязательный набор линтеров из боевых Go-сервисов, плюс depguard
-# с правилами слоёв из лабораторной работы 2.
-
 version: "2"
 
 run:
@@ -19,7 +13,7 @@ issues:
 linters:
   default: none
   enable:
-    - depguard        # правила зависимостей между слоями, см. лабораторную работу 2
+    - depguard
     - errcheck
     - forbidigo
     - gochecknoinits
@@ -39,8 +33,6 @@ linters:
     - whitespace
 
   settings:
-    # Слои: домен ничего не знает про инфраструктуру, usecase не знает про транспорт.
-    # Так правило перестаёт быть договорённостью и становится частью сборки.
     depguard:
       rules:
         domain:
@@ -70,8 +62,6 @@ linters:
             - pkg: github.com/Masterminds/squirrel
               desc: usecase не строит SQL
 
-    # Запрещает обращения через идентификатор с подчёркиванием, поэтому пакеты
-    # называем без snake_case: internal/adapter/http, а не internal/adapter/http_server.
     forbidigo:
       forbid:
         - pattern: ^[A-Za-z0-9]{1,}_.*\.
@@ -98,7 +88,6 @@ linters:
       - third_party$
       - builtin$
       - examples$
-      # сгенерированный по OpenAPI и protobuf код не линтуем
       - api/
       - gen/
 

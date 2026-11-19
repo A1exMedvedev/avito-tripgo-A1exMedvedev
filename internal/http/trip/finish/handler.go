@@ -1,7 +1,6 @@
 package finish
 
 import (
-	"log/slog"
 	"net/http"
 
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/api"
@@ -11,10 +10,10 @@ import (
 
 type Handler struct {
 	usecase usecase
-	log     *slog.Logger
+	log     logger
 }
 
-func New(u usecase, log *slog.Logger) *Handler {
+func New(u usecase, log logger) *Handler {
 	return &Handler{usecase: u, log: log}
 }
 

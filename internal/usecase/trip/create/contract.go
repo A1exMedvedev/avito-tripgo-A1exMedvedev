@@ -3,7 +3,6 @@ package create
 
 import (
 	"context"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -18,9 +17,8 @@ type (
 		Fetch(ctx context.Context, id uuid.UUID) (trip.Trip, error)
 	}
 
-	idempotencyRepository interface {
-		ClaimIdempotencyKey(ctx context.Context, k model.IdempotencyKey, expiredBefore time.Time) (claimed bool, err error)
-		FetchIdempotencyKey(ctx context.Context, key uuid.UUID) (model.IdempotencyKey, error)
+	idempotency interface {
+		Claim(ctx context.Context, k model.IdempotencyKey) (existingTripID uuid.UUID, claimed bool, err error)
 	}
 
 	txManager interface {
@@ -29,5 +27,9 @@ type (
 
 	metrics interface {
 		TripCreated(ctx context.Context)
+	}
+
+	logger interface {
+		InfoContext(ctx context.Context, msg string, args ...any)
 	}
 )

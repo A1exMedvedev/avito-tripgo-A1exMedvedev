@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strings"
 
@@ -25,7 +24,7 @@ import (
 const maxBodyBytes = 1 << 20
 
 type Telemetry struct {
-	Log            *slog.Logger
+	Log            logger
 	TracerProvider trace.TracerProvider
 	MeterProvider  metric.MeterProvider
 	Propagator     propagation.TextMapPropagator

@@ -1,7 +1,6 @@
 package create
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -17,37 +16,37 @@ import (
 const reasonCreated = "trip created"
 
 type Usecase struct {
-	trips          tripRepository
-	keys           idempotencyRepository
-	tx             txManager
-	metrics        metrics
-	log            *slog.Logger
-	now            func() time.Time
-	idempotencyTTL time.Duration
+	trips       tripRepository
+	idempotency idempotency
+	tx          txManager
+	metrics     metrics
+	log         logger
+	now         func() time.Time
+	newID       func() (uuid.UUID, error)
 }
 
 func New(
 	trips tripRepository,
-	keys idempotencyRepository,
+	idem idempotency,
 	tx txManager,
 	m metrics,
-	log *slog.Logger,
+	log logger,
 	now func() time.Time,
-	idempotencyTTL time.Duration,
+	newID func() (uuid.UUID, error),
 ) *Usecase {
 	return &Usecase{
-		trips:          trips,
-		keys:           keys,
-		tx:             tx,
-		metrics:        m,
-		log:            log,
-		now:            now,
-		idempotencyTTL: idempotencyTTL,
+		trips:       trips,
+		idempotency: idem,
+		tx:          tx,
+		metrics:     m,
+		log:         log,
+		now:         now,
+		newID:       newID,
 	}
 }
 
 func (u *Usecase) Do(ctx context.Context, in model.CreateTripInput) (model.CreateTripResult, error) {
-	id, err := uuid.NewV7()
+	id, err := u.newID()
 	if err != nil {
 		return model.CreateTripResult{}, fmt.Errorf("generate trip id: %w", err)
 	}
@@ -61,7 +60,12 @@ func (u *Usecase) Do(ctx context.Context, in model.CreateTripInput) (model.Creat
 
 	err = u.tx.Do(ctx, func(ctx context.Context) error {
 		if in.IdempotencyKey != nil {
-			existing, claimed, err := u.claimIdempotencyKey(ctx, *in.IdempotencyKey, hashParams(in.Params), t)
+			existing, claimed, err := u.idempotency.Claim(ctx, model.IdempotencyKey{
+				Key:         *in.IdempotencyKey,
+				RequestHash: hashParams(in.Params),
+				TripID:      t.ID,
+				CreatedAt:   t.StartedAt,
+			})
 			if err != nil {
 				return err
 			}
@@ -95,29 +99,6 @@ func (u *Usecase) Do(ctx context.Context, in model.CreateTripInput) (model.Creat
 	}
 
 	return model.CreateTripResult{Trip: t, Replayed: replayed}, nil
-}
-
-func (u *Usecase) claimIdempotencyKey(ctx context.Context, key uuid.UUID, hash []byte, t trip.Trip) (existingTripID uuid.UUID, claimed bool, err error) {
-	claimed, err = u.keys.ClaimIdempotencyKey(ctx, model.IdempotencyKey{
-		Key:         key,
-		RequestHash: hash,
-		TripID:      t.ID,
-		CreatedAt:   t.StartedAt,
-	}, t.StartedAt.Add(-u.idempotencyTTL))
-	if err != nil || claimed {
-		return uuid.Nil, claimed, err
-	}
-
-	existing, err := u.keys.FetchIdempotencyKey(ctx, key)
-	if err != nil {
-		return uuid.Nil, false, err
-	}
-
-	if !bytes.Equal(existing.RequestHash, hash) {
-		return uuid.Nil, false, trip.ErrIdempotencyConflict
-	}
-
-	return existing.TripID, false, nil
 }
 
 func hashParams(p trip.Params) []byte {
