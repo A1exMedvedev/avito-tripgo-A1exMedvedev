@@ -5,10 +5,14 @@ export
 MIGRATIONS_DIR := migrations
 GOOSE = go tool goose -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)"
 
-.PHONY: generate migrate migrate-down migrate-reset migrate-status run build test docker-build docker-run check-db-url
+GOLANGCI_LINT = go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
+COVER_PACKAGES = ./internal/domain/...,./internal/usecase/...
+
+.PHONY: generate migrate migrate-down migrate-reset migrate-status run build test test-integration lint fmt docker-build docker-run check-db-url
 
 generate:
 	go tool oapi-codegen -config api/oapi-codegen.yaml contracts/openapi/trip-service.openapi.yaml
+	go generate ./...
 
 migrate: check-db-url
 	$(GOOSE) up
@@ -29,7 +33,18 @@ build:
 	go build -o bin/trip-service ./cmd/trip-service
 
 test:
-	go test -race ./...
+	go test -race -count=1 -coverpkg=$(COVER_PACKAGES) -coverprofile=coverage.out ./...
+	@echo "coverage of internal/domain and internal/usecase:"
+	@go tool cover -func=coverage.out | tail -n 1
+
+test-integration:
+	go test -race -count=1 -tags=integration ./internal/repository/...
+
+lint:
+	$(GOLANGCI_LINT) run ./...
+
+fmt:
+	$(GOLANGCI_LINT) fmt ./...
 
 IMAGE ?= trip-service:local
 
