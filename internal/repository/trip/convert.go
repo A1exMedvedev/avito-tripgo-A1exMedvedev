@@ -11,14 +11,14 @@ const columnStatus = "status"
 var tripColumns = []string{
 	"id", "user_id", "driver_id",
 	"start_latitude", "start_longitude", "end_latitude", "end_longitude",
-	"price", columnStatus, "started_at", "finished_at",
+	"price", columnStatus, "started_at", "finished_at", "last_position_at",
 }
 
 func tripValues(t trip.Trip) []any {
 	return []any{
 		t.ID, t.UserID, t.DriverID,
 		t.Start.Latitude, t.Start.Longitude, t.End.Latitude, t.End.Longitude,
-		t.Price, t.Status, t.StartedAt, t.FinishedAt,
+		t.Price, t.Status, t.StartedAt, t.FinishedAt, t.LastPositionAt,
 	}
 }
 
@@ -28,7 +28,7 @@ func scanTrip(row pgx.Row) (trip.Trip, error) {
 	err := row.Scan(
 		&t.ID, &t.UserID, &t.DriverID,
 		&t.Start.Latitude, &t.Start.Longitude, &t.End.Latitude, &t.End.Longitude,
-		&t.Price, &t.Status, &t.StartedAt, &t.FinishedAt,
+		&t.Price, &t.Status, &t.StartedAt, &t.FinishedAt, &t.LastPositionAt,
 	)
 	if err != nil {
 		return trip.Trip{}, err
@@ -37,6 +37,10 @@ func scanTrip(row pgx.Row) (trip.Trip, error) {
 	t.StartedAt = t.StartedAt.UTC()
 	if t.FinishedAt != nil {
 		t.FinishedAt = new(t.FinishedAt.UTC())
+	}
+
+	if t.LastPositionAt != nil {
+		t.LastPositionAt = new(t.LastPositionAt.UTC())
 	}
 
 	return t, nil

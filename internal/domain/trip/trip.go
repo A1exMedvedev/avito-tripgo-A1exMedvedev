@@ -24,15 +24,25 @@ type Point struct {
 }
 
 type Trip struct {
-	ID         uuid.UUID
-	UserID     uuid.UUID
-	DriverID   uuid.UUID
-	Start      Point
-	End        Point
-	Price      int64
-	Status     Status
-	StartedAt  time.Time
-	FinishedAt *time.Time
+	ID             uuid.UUID
+	UserID         uuid.UUID
+	DriverID       uuid.UUID
+	Start          Point
+	End            Point
+	Price          int64
+	Status         Status
+	StartedAt      time.Time
+	FinishedAt     *time.Time
+	LastPositionAt *time.Time
+}
+
+const MaxPositionClockSkew = time.Minute
+
+type Position struct {
+	ID         int64
+	TripID     uuid.UUID
+	Point      Point `field:"coordinates"`
+	RecordedAt time.Time
 }
 
 type Params struct {
@@ -82,15 +92,58 @@ func (t *Trip) Finish(at time.Time) error {
 	return nil
 }
 
+func (t Trip) EnsureActive() error {
+	if t.Status != StatusActive {
+		return ErrTripCompleted
+	}
+
+	return nil
+}
+
+func NewPosition(tripID uuid.UUID, point Point, recordedAt, now time.Time) (Position, error) {
+	p := Position{TripID: tripID, Point: point, RecordedAt: recordedAt}
+
+	fields, err := validateStruct(p)
+	if err != nil {
+		return Position{}, fmt.Errorf("validate position: %w", err)
+	}
+
+	if recordedAt.After(now.Add(MaxPositionClockSkew)) {
+		fields = append(fields, FieldError{
+			Field:   "recorded_at",
+			Message: "must not be more than " + MaxPositionClockSkew.String() + " in the future",
+		})
+	}
+
+	if len(fields) > 0 {
+		return Position{}, &ValidationError{Fields: fields}
+	}
+
+	return p, nil
+}
+
 func (p Params) Validate() error {
-	err := validate.Struct(p)
+	fields, err := validateStruct(p)
+	if err != nil {
+		return fmt.Errorf("validate trip params: %w", err)
+	}
+
+	if len(fields) > 0 {
+		return &ValidationError{Fields: fields}
+	}
+
+	return nil
+}
+
+func validateStruct(v any) ([]FieldError, error) {
+	err := validate.Struct(v)
 	if err == nil {
-		return nil
+		return nil, nil
 	}
 
 	fieldErrs, ok := errors.AsType[validator.ValidationErrors](err)
 	if !ok {
-		return fmt.Errorf("validate trip params: %w", err)
+		return nil, err
 	}
 
 	fields := make([]FieldError, 0, len(fieldErrs))
@@ -99,7 +152,7 @@ func (p Params) Validate() error {
 		fields = append(fields, FieldError{Field: field, Message: message(fe)})
 	}
 
-	return &ValidationError{Fields: fields}
+	return fields, nil
 }
 
 func message(fe validator.FieldError) string {

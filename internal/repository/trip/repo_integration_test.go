@@ -31,6 +31,7 @@ import (
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/infra/postgres"
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/infra/postgres/transaction"
 	"github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/model"
+	positionrepo "github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/repository/position"
 	triprepo "github.com/A1exMedvedev/avito-tripgo-A1exMedvedev/internal/repository/trip"
 )
 
@@ -43,6 +44,7 @@ var (
 	testPool *pgxpool.Pool
 	txm      *transaction.Manager
 	repo     *triprepo.Repo
+	posRepo  *positionrepo.Repo
 )
 
 func TestMain(m *testing.M) {
@@ -98,6 +100,7 @@ func run(m *testing.M) int {
 
 	txm = transaction.NewManager(testPool, pgx.ReadCommitted, queryTimeout)
 	repo = triprepo.New(txm, queryTimeout)
+	posRepo = positionrepo.New(txm, queryTimeout)
 
 	return m.Run()
 }
@@ -452,4 +455,158 @@ func TestTransaction_NestedDoSharesOuterTransaction(t *testing.T) {
 
 	require.ErrorIs(t, err, errBoom)
 	assert.Equal(t, 0, countRows(t, "trips", tr.ID))
+}
+
+func staleIDs(t *testing.T, staleAfter time.Duration, among ...uuid.UUID) []uuid.UUID {
+	t.Helper()
+
+	stale, err := repo.ListStale(context.Background(), staleAfter)
+	require.NoError(t, err)
+
+	wanted := map[uuid.UUID]bool{}
+	for _, id := range among {
+		wanted[id] = true
+	}
+
+	var ids []uuid.UUID
+
+	for _, st := range stale {
+		if wanted[st.ID] {
+			ids = append(ids, st.ID)
+		}
+	}
+
+	return ids
+}
+
+func TestListStale_SelectsOnlyActiveTripsWithoutFreshPositions(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	silentLongest := newTrip(t)
+	silentLongest.StartedAt = now.Add(-3 * time.Hour)
+
+	silent := newTrip(t)
+	silent.StartedAt = now.Add(-2 * time.Hour)
+
+	staleByPosition := newTrip(t)
+	staleByPosition.StartedAt = now.Add(-5 * time.Hour)
+
+	fresh := newTrip(t)
+	fresh.StartedAt = now.Add(-2 * time.Hour)
+
+	justStarted := newTrip(t)
+	justStarted.StartedAt = now
+
+	completed := newTrip(t)
+	completed.StartedAt = now.Add(-4 * time.Hour)
+
+	for _, tr := range []trip.Trip{silentLongest, silent, staleByPosition, fresh, justStarted, completed} {
+		require.NoError(t, repo.Save(ctx, tr))
+	}
+
+	require.NoError(t, repo.UpdateLastPosition(ctx, staleByPosition.ID, now.Add(-150*time.Minute)))
+	require.NoError(t, repo.UpdateLastPosition(ctx, fresh.ID, now.Add(-time.Minute)))
+	require.NoError(t, completed.Finish(now))
+	require.NoError(t, repo.Finish(ctx, completed))
+
+	got := staleIDs(t, time.Hour, silentLongest.ID, silent.ID, staleByPosition.ID, fresh.ID, justStarted.ID, completed.ID)
+
+	assert.Equal(t, []uuid.UUID{silentLongest.ID, staleByPosition.ID, silent.ID}, got,
+		"без координат отсчёт от started_at, первыми молчащие дольше всех; свежая и завершённая не попадают")
+}
+
+func TestUpdateLastPosition_OldPositionDoesNotAgeTrip(t *testing.T) {
+	ctx := context.Background()
+	tr := newTrip(t)
+	require.NoError(t, repo.Save(ctx, tr))
+
+	latest := tr.StartedAt.Add(10 * time.Minute)
+	require.NoError(t, repo.UpdateLastPosition(ctx, tr.ID, latest))
+	require.NoError(t, repo.UpdateLastPosition(ctx, tr.ID, latest.Add(-5*time.Minute)))
+
+	got, err := repo.Fetch(ctx, tr.ID)
+	require.NoError(t, err)
+	assert.Equal(t, &latest, got.LastPositionAt)
+}
+
+func TestUpdateLastPosition_CompletedTrip(t *testing.T) {
+	ctx := context.Background()
+	tr := newTrip(t)
+	require.NoError(t, repo.Save(ctx, tr))
+	require.NoError(t, tr.Finish(tr.StartedAt.Add(time.Minute)))
+	require.NoError(t, repo.Finish(ctx, tr))
+
+	require.ErrorIs(t, repo.UpdateLastPosition(ctx, tr.ID, tr.StartedAt), trip.ErrTripCompleted)
+}
+
+func savePosition(ctx context.Context, p trip.Position) error {
+	return txm.Do(ctx, func(ctx context.Context) error {
+		if err := repo.UpdateLastPosition(ctx, p.TripID, p.RecordedAt); err != nil {
+			return err
+		}
+
+		_, err := posRepo.Save(ctx, p)
+
+		return err
+	})
+}
+
+func TestSavePosition_UpdatesLastPositionAt(t *testing.T) {
+	ctx := context.Background()
+	tr := newTrip(t)
+	require.NoError(t, repo.Save(ctx, tr))
+
+	recordedAt := tr.StartedAt.Add(time.Minute)
+	require.NoError(t, savePosition(ctx, trip.Position{TripID: tr.ID, Point: trip.Point{Latitude: 59.93, Longitude: 30.33}, RecordedAt: recordedAt}))
+
+	got, err := repo.Fetch(ctx, tr.ID)
+	require.NoError(t, err)
+	assert.Equal(t, &recordedAt, got.LastPositionAt)
+
+	positions, err := posRepo.List(ctx, tr.ID)
+	require.NoError(t, err)
+	require.Len(t, positions, 1)
+	assert.Equal(t, recordedAt, positions[0].RecordedAt)
+}
+
+func TestSavePosition_RollsBackAtomically(t *testing.T) {
+	ctx := context.Background()
+	tr := newTrip(t)
+	require.NoError(t, repo.Save(ctx, tr))
+
+	err := savePosition(ctx, trip.Position{TripID: tr.ID, Point: trip.Point{Latitude: 100}, RecordedAt: tr.StartedAt.Add(time.Minute)})
+
+	require.Error(t, err, "широта вне диапазона нарушает CHECK, вставка падает после обновления trips")
+
+	got, err := repo.Fetch(ctx, tr.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.LastPositionAt, "обновление last_position_at откатилось вместе со вставкой")
+
+	positions, err := posRepo.List(ctx, tr.ID)
+	require.NoError(t, err)
+	assert.Empty(t, positions)
+}
+
+func TestListPositions_SortedByRecordedAtThenID(t *testing.T) {
+	ctx := context.Background()
+	tr := newTrip(t)
+	require.NoError(t, repo.Save(ctx, tr))
+
+	later := tr.StartedAt.Add(2 * time.Minute)
+	earlier := tr.StartedAt.Add(time.Minute)
+
+	recorded := []time.Time{later, earlier, earlier}
+	saved := make([]trip.Position, 0, len(recorded))
+
+	for _, at := range recorded {
+		p, err := posRepo.Save(ctx, trip.Position{TripID: tr.ID, Point: trip.Point{Latitude: 1, Longitude: 1}, RecordedAt: at})
+		require.NoError(t, err)
+
+		saved = append(saved, p)
+	}
+
+	got, err := posRepo.List(ctx, tr.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []trip.Position{saved[1], saved[2], saved[0]}, got)
 }

@@ -32,3 +32,15 @@ type IdempotencyKey struct {
 	TripID      uuid.UUID
 	CreatedAt   time.Time
 }
+
+type SavePositionInput struct {
+	TripID     uuid.UUID
+	Point      trip.Point
+	RecordedAt time.Time
+}
+
+type StaleTrip struct {
+	ID         uuid.UUID
+	DriverID   uuid.UUID
+	LastSeenAt time.Time
+}

@@ -11,6 +11,9 @@ type Handlers struct {
 	Get    tripHandler
 	Finish tripHandler
 	Health healthHandler
+
+	SavePosition  tripHandler
+	ListPositions tripHandler
 }
 
 var _ api.ServerInterface = (*server)(nil)
@@ -37,4 +40,12 @@ func (s *server) Health(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) Ready(w http.ResponseWriter, r *http.Request) {
 	s.handlers.Health.Ready(w, r)
+}
+
+func (s *server) CreateTripPosition(w http.ResponseWriter, r *http.Request, tripID api.TripId) {
+	s.handlers.SavePosition.Handle(w, r, tripID)
+}
+
+func (s *server) ListTripPositions(w http.ResponseWriter, r *http.Request, tripID api.TripId) {
+	s.handlers.ListPositions.Handle(w, r, tripID)
 }

@@ -213,3 +213,85 @@ func TestTrip_Finish(t *testing.T) {
 		})
 	}
 }
+
+func TestNewPosition(t *testing.T) {
+	now := startedAt
+	point := trip.Point{Latitude: 59.935, Longitude: 30.335}
+
+	tests := []struct {
+		name       string
+		point      trip.Point
+		recordedAt time.Time
+		want       trip.Position
+		wantFields []trip.FieldError
+	}{
+		{
+			name:       "успех",
+			point:      point,
+			recordedAt: now.Add(-time.Hour),
+			want:       trip.Position{TripID: tripID, Point: point, RecordedAt: now.Add(-time.Hour)},
+		},
+		{
+			name:       "минута в будущем допустима",
+			point:      point,
+			recordedAt: now.Add(trip.MaxPositionClockSkew),
+			want:       trip.Position{TripID: tripID, Point: point, RecordedAt: now.Add(trip.MaxPositionClockSkew)},
+		},
+		{
+			name:       "больше минуты в будущем",
+			point:      point,
+			recordedAt: now.Add(trip.MaxPositionClockSkew + time.Second),
+			wantFields: []trip.FieldError{{Field: "recorded_at", Message: "must not be more than 1m0s in the future"}},
+		},
+		{
+			name:       "координаты вне диапазона",
+			point:      trip.Point{Latitude: 91, Longitude: -181},
+			recordedAt: now,
+			wantFields: []trip.FieldError{
+				{Field: "coordinates.latitude", Message: "must be <= 90"},
+				{Field: "coordinates.longitude", Message: "must be >= -180"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := trip.NewPosition(tripID, tt.point, tt.recordedAt, now)
+
+			if tt.wantFields == nil {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.want, got)
+
+				return
+			}
+
+			var validationErr *trip.ValidationError
+			if assert.ErrorAs(t, err, &validationErr) {
+				assert.Equal(t, tt.wantFields, validationErr.Fields)
+			}
+		})
+	}
+}
+
+func TestTrip_EnsureActive(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      trip.Trip
+		wantErr assert.ErrorAssertionFunc
+	}{
+		{name: "активная поездка принимает координаты", in: trip.Trip{Status: trip.StatusActive}, wantErr: assert.NoError},
+		{
+			name: "завершённая не принимает",
+			in:   trip.Trip{Status: trip.StatusCompleted},
+			wantErr: func(t assert.TestingT, err error, msgAndArgs ...any) bool {
+				return assert.ErrorIs(t, err, trip.ErrTripCompleted, msgAndArgs...)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.wantErr(t, tt.in.EnsureActive())
+		})
+	}
+}

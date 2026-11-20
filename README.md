@@ -9,7 +9,9 @@
   менеджер транзакций, плюс оба задания со звёздочкой: идемпотентность по
   `Idempotency-Key` и многостадийный `Dockerfile`;
 - **лабораторная работа 2**: код разложен по слоям, есть тесты, линтер, логи, метрики
-  и трейсы. Снаружи сервис ведёт себя так же, новых ручек и миграций нет.
+  и трейсы. Снаружи сервис ведёт себя так же, новых ручек и миграций нет;
+- **лабораторная работа 3**: координаты и маршрут поездки, фоновый опрос поездок без
+  свежих координат через сканер, ограниченную очередь, пул воркеров и Push Service.
 
 ## Требования
 
@@ -80,6 +82,12 @@ make run                       # сервис на $HTTP_ADDR (по умолча
 | `HTTP_WRITE_TIMEOUT` | нет | `15s` | `http.Server.WriteTimeout` |
 | `HTTP_IDLE_TIMEOUT` | нет | `60s` | `http.Server.IdleTimeout` |
 | `IDEMPOTENCY_KEY_TTL` | нет | `24h` | сколько живёт ключ `Idempotency-Key` |
+| `POSITION_CHECK_INTERVAL` | нет | `30s` | период тикера сканера и пауза между повторными пушами |
+| `POSITION_STALE_AFTER` | нет | `60s` | сколько поездка может молчать, прежде чем её опросить |
+| `POSITION_WORKERS` | нет | `4` | число воркеров |
+| `POSITION_QUEUE_SIZE` | нет | `100` | ёмкость очереди |
+| `PUSH_HTTP_URL` | да | `http://localhost:8090` | адрес Push Service, пишет `tripgoctl` в `.env` |
+| `PUSH_REQUEST_TIMEOUT` | нет | `1s` | таймаут одного вызова Push Service |
 
 У необязательных переменных есть значения по умолчанию, и сервис запускается с `.env`,
 который сгенерировал `tripgoctl`.
@@ -95,6 +103,8 @@ make run                       # сервис на $HTTP_ADDR (по умолча
 | `POST` | `/api/v1/trips/{tripId}/finish` | `200`, `400`, `404`, `409 trip_completed`, `500` |
 | `GET` | `/health` | `200` |
 | `GET` | `/ready` | `200`, `503` |
+| `POST` | `/api/v1/trips/{tripId}/positions` | `201`, `400` (координаты вне диапазона, `recorded_at` не разобрался или больше чем на минуту в будущем), `404`, `409 trip_completed`, `500` |
+| `GET` | `/api/v1/trips/{tripId}/positions` | `200` (точки по `recorded_at`, затем по `id`), `400`, `404`, `500` |
 
 Ошибки отдаются по RFC 9457 в `application/problem+json` с полем `code`. Текст
 ошибок базы и SQL в ответ не попадает, только в лог.
@@ -137,6 +147,12 @@ http/*   usecase/*   repository/*  ──► infra/postgres
 | `internal/model` | структуры, которые ходят между слоями | домен |
 | `internal/usecase/trip/{create,get,finish}` | сценарии: транзакции, бизнес-логи, бизнес-метрики | домен, `model` |
 | `internal/service/idempotency` | занятие ключа идемпотентности, срок жизни ключа, сравнение отпечатков | домен, `model` |
+| `internal/usecase/position/{save,list}` | сохранение координаты и маршрут | домен, `model` |
+| `internal/http/position/{save,list}` | ручки координат | домен, `model`, `api` |
+| `internal/repository/position` | SQL для `trip_positions` | домен, `infra/postgres/transaction` |
+| `internal/worker/positions` | сканер, очередь, пул воркеров | `model`, OTel |
+| `internal/gateway/push` | HTTP-клиент Push Service | OTel |
+| `internal/infra/clock` | настоящий тикер за интерфейсом сканера | ничего |
 | `internal/http/trip/{create,get,finish}` | разбор запроса и ответ, по пакету на ручку | домен, `model`, `api` |
 | `internal/http/health` | `/health` и `/ready` | `api` |
 | `internal/http/domainerror` | единственный маппинг ошибки в `Problem` | домен, `api` |
@@ -190,7 +206,9 @@ Usecase только решает, когда занимать ключ, и сч
 | Сервис идемпотентности | `internal/service/idempotency` | `gomock` на репозиторий |
 | Маппинг ошибок | `internal/http/domainerror` | table-driven |
 | Хендлеры | `internal/http/trip/*`, `internal/http/health` | `httptest` + моки usecase и логгера |
-| Репозиторий, транзакции | `internal/repository/trip` | настоящий PostgreSQL, тег `integration` |
+| Репозиторий, транзакции, выборка для опроса, координаты | `internal/repository/trip` | настоящий PostgreSQL, тег `integration` |
+| Сканер, очередь, воркеры | `internal/worker/positions` | `gomock`, управляемый тикер, in-memory метрики, `goleak` |
+| Гейтвей Push Service | `internal/gateway/push` | `httptest.Server`, `goleak` |
 
 Unit-тесты написаны в одном стиле: один табличный тест на функцию, у каждого сценария
 своя функция `setup`, которая задаёт поведение моков, ожидаемый результат и
@@ -210,6 +228,24 @@ Unit-тесты написаны в одном стиле: один таблич
 | ошибка репозитория → `500` без деталей | `http/trip/*: TestHandler_Handle/ошибка репозитория → 500 без деталей…`, `http/domainerror: TestWrite` |
 | откат `INSERT` в двух таблицах | `repository/trip: TestTransaction_RollbackRevertsBothTables` |
 
+Сценарии лабораторной работы 3:
+
+| Сценарий | Тест |
+|---|---|
+| выборка: свежая и завершённая не попадают, поездка без координат попадает | `repository/trip: TestListStale_SelectsOnlyActiveTripsWithoutFreshPositions` |
+| поездка в очереди повторным тиком не добавляется | `worker/positions: TestPool_ScanOnce/поездка, уже стоящая в очереди…` |
+| координата между постановкой и обработкой отменяет отправку | `worker/positions: TestPool_PositionBetweenQueueAndProcessingCancelsPush` |
+| переполнение даёт `dropped`, а не блокировку сканера | `worker/positions: TestPool_ScanOnce/переполнение очереди…` |
+| пул обрабатывает N задач `POSITION_WORKERS` воркерами | `worker/positions: TestPool_ProcessesTasksWithFixedNumberOfWorkers` |
+| по остановке сканер и воркеры завершаются, горутин не остаётся | `worker/positions: TestPool_ScannerStopsOnCancel`, `TestPool_StopFinishesQueuedTasks`, `goleak.VerifyTestMain` |
+| ошибка Push Service не роняет воркер | `worker/positions: TestPool_PushErrorDoesNotStopWorker` |
+| сохранение координаты обновляет `last_position_at` и откатывается целиком | `repository/trip: TestSavePosition_UpdatesLastPositionAt`, `TestSavePosition_RollsBackAtomically` |
+| старая координата не «состаривает» поездку | `repository/trip: TestUpdateLastPosition_OldPositionDoesNotAgeTrip` |
+| тики не накладываются | `worker/positions: TestPool_ScannerRunsOnTickAndTicksDoNotOverlap` |
+
+Время в тестах сканера подменено: тикер спрятан за интерфейсом `clock`, тест сам
+отправляет тики в канал. `time.Sleep` нигде нет, синхронизация — каналами.
+
 Интеграционные тесты сами поднимают контейнер с PostgreSQL и накатывают миграции. Каждый
 тест создаёт поездку со случайными идентификаторами и удаляет её в `t.Cleanup`, поэтому
 тесты изолированы и проходят при повторном запуске.
@@ -220,6 +256,88 @@ Unit-тесты написаны в одном стиле: один таблич
 ```bash
 DOCKER_HOST=unix://$HOME/.lima/<instance>/sock/docker.sock TESTCONTAINERS_RYUK_DISABLED=true make test-integration
 ```
+
+## Опрос устаревших поездок
+
+```
+              каждые POSITION_CHECK_INTERVAL
+ PostgreSQL ──────────────► сканер ──► очередь (канал на POSITION_QUEUE_SIZE) ──► POSITION_WORKERS воркеров ──► Push Service
+     ▲       одна выборка     │              ▲                                         │   REQUEST_POSITION,
+     │                        │              │ Cancel(tripID)                          │   таймаут PUSH_REQUEST_TIMEOUT
+     └── POST /positions ─────┘──────────────┘                                         ▼
+                                                                             «пришли координату» на устройство
+```
+
+- **Сканер** — одна горутина с тикером. На каждом тике один запрос выбирает активные
+  поездки, у которых `COALESCE(last_position_at, started_at)` старше
+  `POSITION_STALE_AFTER`, первыми те, что молчат дольше всех. Условие по времени считается
+  в SQL (`now() - make_interval(secs => …)`). Обход идёт в той же горутине, поэтому тики не
+  накладываются: пока обход не закончен, следующий тик не принимается, а `time.Ticker`
+  сам выбрасывает пропущенные.
+- **Индекс** — частичный по выражению: `(COALESCE(last_position_at, started_at), id) WHERE
+  status = 'active'` (миграция `00006`, `CREATE INDEX CONCURRENTLY`). Он покрывает и
+  фильтр, и сортировку, а завершённые поездки, которых со временем большинство, в него не
+  попадают.
+- **Очередь** — буферизованный канал плюс структура «сейчас в очереди» (`pending`,
+  `map[tripID]номер задачи` под мьютексом). Проверка «уже в очереди?» и постановка в канал
+  делаются под одним мьютексом, поэтому сканер не может поставить поездку дважды.
+  Постановка неблокирующая (`select` с `default`): если очередь полна, поездка не ставится,
+  растут `tripgo.stale_checks{result="dropped"}` и `tripgo.position_requests{result="dropped"}`,
+  в лог пишется `Warn`.
+- **Что будет при исчерпании очереди.** Сканер не блокируется и дальше проверяет остальные
+  поездки. Дропнутая поездка не теряется: координат по-прежнему нет, и она попадёт в выборку
+  на следующем тике. Память не растёт: очередь ограничена, а `pending` не больше её ёмкости
+  плюс задачи в работе.
+- **Воркеры** запускаются при старте, их ровно `POSITION_WORKERS`, горутина на задачу не
+  создаётся. Воркер берёт задачу, проверяет, что она всё ещё в `pending` с тем же номером,
+  вызывает Push Service с таймаутом и только после вызова убирает поездку из `pending`. Пока
+  идёт вызов, следующий тик видит поездку в очереди и считает её `duplicate`.
+- **Отмена.** Сохранение координаты после коммита зовёт `Cancel(tripID)` и убирает поездку
+  из `pending`. Задача, которая уже лежит в канале, при обработке отбрасывается: номера нет
+  или он другой. Номер нужен на случай, когда поездку успели отменить и поставить заново:
+  старая задача не должна отправить второй пуш.
+- **Пауза между пушами** — период тикера. Отметку об отправке мы не храним, поэтому
+  неответившая поездка снова попадёт в выборку через `POSITION_CHECK_INTERVAL`.
+- **Ошибки Push Service** не роняют воркер: одна попытка, `Warn` в лог, `result="error"` в
+  метриках. Ретраев нет, они в лабораторной работе 5. Гейтвей различает ошибку транспорта,
+  `4xx` (`ErrRejected`) и `5xx` (`ErrUnavailable`) и всегда дочитывает и закрывает тело.
+- **Трейсы.** Обход — спан `positions.scan` со спанами SQL внутри. Обработка задачи — спан
+  `positions.request` в своём трейсе со span link на обход: она асинхронна и переживает
+  исходный тик. Вызов Push Service — дочерний HTTP-спан, контекст уходит в `traceparent`.
+- **Метрики:** `tripgo.stale_checks{result}`, `tripgo.position_requests.queue.size`,
+  `tripgo.position_requests.workers.active`, `tripgo.position_requests{result}`,
+  `tripgo.position_requests.duration{result}`, `tripgo.positions.saved`.
+
+Остановка, порядок задан в `container.Shutdown`:
+
+1. HTTP-сервер перестаёт принимать запросы и дожидается текущих;
+2. сканер останавливается, новые задачи не появляются;
+3. очередь закрывается, воркеры дорабатывают то, что в ней осталось. Если общий
+   `SHUTDOWN_TIMEOUT` кончился, контекст воркеров отменяется, текущие вызовы
+   обрываются, и воркеры выходят;
+4. сбрасывается телеметрия, закрываются HTTP-клиент Push Service и пул БД.
+
+Если остановить воркеры раньше сканера, сканер писал бы в закрытый канал. Если закрыть
+пул БД раньше сканера, тик упал бы на запросе. После остановки горутин не остаётся, это
+проверяет `goleak`.
+
+### Упрощения
+
+- выборка без `LIMIT`: на десятках тысяч поездок запрос тяжёлый, а большая часть результата
+  всё равно не влезет в очередь;
+- очередь FIFO: поездка, которая не ответила, на следующем тике встаёт в хвост за остатками
+  прошлого тика, хотя молчит дольше них;
+- отметка об отправке не хранится: пауза между пушами равна периоду тикера, их нельзя
+  развести.
+
+### Сохранение координаты
+
+В одной транзакции: чтение поездки (`404`), проверка `Trip.EnsureActive` (`409`), затем
+`UPDATE trips SET last_position_at = GREATEST(last_position_at, $recorded_at) WHERE id = $1
+AND status = 'active'` и `INSERT` в `trip_positions`. `GREATEST` в PostgreSQL пропускает
+`NULL`, поэтому первая координата просто записывается, а опоздавшая старая не уменьшает
+значение: сравнение идёт в самом запросе, без чтения в Go. Условие на статус в `UPDATE`
+защищает от гонки с параллельным завершением: ноль строк — `409`.
 
 ## Observability
 
